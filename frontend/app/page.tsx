@@ -1,0 +1,593 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import {
+  api,
+  AIResult,
+  Contact,
+  ContactDetail,
+  formatDate,
+  Stats,
+  SyncRun,
+  tierClass,
+  reviewClass,
+} from "@/lib/api";
+import { InfoTip, SectionHeading } from "@/components/InfoTip";
+import { Nav } from "@/components/Nav";
+import { RelevanceTierHelp, ScoreBreakdownHelp } from "@/lib/helpText";
+
+export default function HomePage() {
+  const [auth, setAuth] = useState<{ connected: boolean; user_email: string | null } | null>(null);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [selected, setSelected] = useState<ContactDetail | null>(null);
+  const [messages, setMessages] = useState<
+    Array<{ id: string; subject: string; sent_datetime: string; body_preview: string; outlook_weblink: string }>
+  >([]);
+  const [sync, setSync] = useState<SyncRun | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [aiLoading, setAiLoading] = useState<string | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const [q, setQ] = useState("");
+  const [fundraisingTier, setFundraisingTier] = useState("");
+  const [emailCountMin, setEmailCountMin] = useState("");
+  const [reviewFilter, setReviewFilter] = useState("");
+
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [authStatus, statsData, contactData, syncData] = await Promise.all([
+        api.authStatus(),
+        api.stats(),
+        api.contacts({
+          page,
+          page_size: 50,
+          q,
+          fundraising_tier: fundraisingTier,
+          email_count_min: emailCountMin || "",
+          review_status: reviewFilter,
+          exclude_internal: true,
+          exclude_noise: true,
+          sort: "list_number",
+          order: "asc",
+        }),
+        api.syncStatus(),
+      ]);
+      setAuth(authStatus);
+      setStats(statsData);
+      setContacts(contactData.items);
+      setTotal(contactData.total);
+      setSync(syncData);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load data");
+    } finally {
+      setLoading(false);
+    }
+  }, [page, q, fundraisingTier, emailCountMin, reviewFilter]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
+
+  useEffect(() => {
+    if (!sync || sync.status !== "running") return;
+    const timer = setInterval(async () => {
+      const status = await api.syncStatus();
+      setSync(status);
+      if (status?.status !== "running") {
+        setSyncing(false);
+        loadAll();
+      }
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [sync, loadAll]);
+
+  async function handleSync() {
+    setSyncing(true);
+    setError(null);
+    try {
+      const run = await api.startSync();
+      setSync(run);
+    } catch (err) {
+      setSyncing(false);
+      setError(err instanceof Error ? err.message : "Sync failed to start");
+    }
+  }
+
+  async function setReviewStatus(contactId: string, review_status: string) {
+    try {
+      const updated = await api.updateContact(contactId, { review_status });
+      setContacts((prev) =>
+        prev.map((c) => (c.id === contactId ? { ...c, review_status: updated.review_status } : c))
+      );
+      if (selected?.id === contactId) {
+        setSelected(updated);
+      }
+      const statsData = await api.stats();
+      setStats(statsData);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update review status");
+    }
+  }
+
+  async function openContact(contact: Contact) {
+    setDetailLoading(true);
+    setSelected({ ...contact } as ContactDetail);
+    setMessages([]);
+    try {
+      const [detail, timeline] = await Promise.all([
+        api.contact(contact.id),
+        api.contactMessages(contact.id),
+      ]);
+      setSelected(detail);
+      setMessages(timeline);
+    } catch (err) {
+      setSelected(null);
+      setError(err instanceof Error ? err.message : "Failed to load contact");
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  function rowClass(contact: Contact) {
+    const classes: string[] = [];
+    if (selected?.id === contact.id) classes.push("row-selected");
+    else if (contact.review_status === "approved") classes.push("row-approved");
+    else if (contact.review_status === "denied") classes.push("row-denied");
+    return classes.join(" ");
+  }
+
+  async function runAiAction(action: "summary" | "threads", force = false) {
+    if (!selected) return;
+    setAiLoading(action);
+    setError(null);
+    try {
+      let result: AIResult;
+      switch (action) {
+        case "summary":
+          result = await api.aiSummary(selected.id, force);
+          setSelected((prev) =>
+            prev ? { ...prev, ai_summary: result.summary || prev.ai_summary } : prev
+          );
+          break;
+        case "threads":
+          result = await api.aiSummarizeThreads(selected.id, force);
+          setSelected((prev) =>
+            prev ? { ...prev, ai_summary: result.summary || prev.ai_summary } : prev
+          );
+          break;
+      }
+      const refreshed = await api.contact(selected.id);
+      setSelected(refreshed);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "AI request failed");
+    } finally {
+      setAiLoading(null);
+    }
+  }
+
+  return (
+    <main className="page">
+      <div className="header">
+        <div>
+          <Nav />
+          <h1 style={{ marginTop: 12 }}>Relationship Intelligence CRM</h1>
+          <p>
+            Outlook Sent Items → contacts, context, and fundraising relevance
+            {auth?.connected && auth.user_email ? ` · ${auth.user_email}` : ""}
+          </p>
+        </div>
+        <div className="actions">
+          {!auth?.connected ? (
+            <a className="button primary" href={api.loginUrl()}>
+              Connect Microsoft Outlook
+            </a>
+          ) : (
+            <button className="primary" onClick={handleSync} disabled={syncing || sync?.status === "running"}>
+              {sync?.status === "running" ? "Syncing…" : "Sync Sent Items"}
+            </button>
+          )}
+          <a className="button" href={api.exportXlsxUrl()}>
+            Export Excel
+          </a>
+          <a className="button" href={api.exportCsvUrl()}>
+            Export CSV
+          </a>
+        </div>
+      </div>
+
+      {error && <div className="banner error">{error}</div>}
+      {sync?.status === "running" && (
+        <div className="banner info">
+          Sync in progress: {sync.messages_fetched.toLocaleString()} messages fetched,{" "}
+          {sync.messages_new.toLocaleString()} new imported.
+        </div>
+      )}
+      {sync?.status === "completed" && sync.completed_at && (
+        <div className="banner success">
+          Last sync completed: {sync.messages_fetched.toLocaleString()} messages,{" "}
+          {sync.messages_new.toLocaleString()} new.
+        </div>
+      )}
+      {sync?.status === "failed" && (
+        <div className="banner error">Sync failed: {sync.error_message}</div>
+      )}
+
+      {stats && (
+        <div className="stats">
+          <div className="stat-card">
+            <div className="label">Outlook Sent Items</div>
+            <div className="value" style={{ fontSize: stats.graph_sent_total ? "1.4rem" : "1rem" }}>
+              {stats.graph_sent_total != null
+                ? stats.sync_complete
+                  ? `${stats.synced_messages.toLocaleString()} ✓`
+                  : `${stats.synced_messages.toLocaleString()} / ${stats.graph_sent_total.toLocaleString()}`
+                : "Connect to verify"}
+            </div>
+            {stats.sync_complete === true && (
+              <div className="stat-note">All sent emails imported</div>
+            )}
+            {stats.sync_complete === false && (
+              <div className="stat-note warn">Run sync again to fetch remaining</div>
+            )}
+          </div>
+          <div className="stat-card">
+            <div className="label">To review</div>
+            <div className="value">{stats.review_pending.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">Approved to email</div>
+            <div className="value">{stats.review_approved.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">Denied</div>
+            <div className="value">{stats.review_denied.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">External contacts</div>
+            <div className="value">{stats.external_contacts.toLocaleString()}</div>
+          </div>
+          <div className="stat-card">
+            <div className="label">Last sync</div>
+            <div className="value" style={{ fontSize: "1rem" }}>
+              {formatDate(stats.last_sync_at)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className={`layout-with-drawer${selected ? " has-drawer" : ""}`}>
+        <div>
+          <div className="panel">
+            <div className="filters">
+              <input
+                placeholder="Search name, email, company, domain…"
+                value={q}
+                onChange={(e) => {
+                  setPage(1);
+                  setQ(e.target.value);
+                }}
+              />
+              <select
+                value={fundraisingTier}
+                onChange={(e) => {
+                  setPage(1);
+                  setFundraisingTier(e.target.value);
+                }}
+              >
+                <option value="">All relevance</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+              </select>
+              <input
+                placeholder="Min emails"
+                value={emailCountMin}
+                onChange={(e) => {
+                  setPage(1);
+                  setEmailCountMin(e.target.value);
+                }}
+              />
+              <select
+                value={reviewFilter}
+                onChange={(e) => {
+                  setPage(1);
+                  setReviewFilter(e.target.value);
+                }}
+              >
+                <option value="">All review status</option>
+                <option value="pending">To review</option>
+                <option value="approved">Approved</option>
+                <option value="denied">Denied</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Name</th>
+                  <th>Email</th>
+                  <th>Company</th>
+                  <th>Last</th>
+                  <th>Emails</th>
+                  <th>Relevance <InfoTip label="How relevance tiers work"><RelevanceTierHelp /></InfoTip></th>
+                  <th>Review</th>
+                  <th>Topics</th>
+                  <th>Last subject</th>
+                  <th>Outlook</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <tr>
+                    <td colSpan={11}>Loading…</td>
+                  </tr>
+                ) : contacts.length === 0 ? (
+                  <tr>
+                    <td colSpan={11}>
+                      No contacts yet. Connect Outlook and run a sync to import Sent Items.
+                    </td>
+                  </tr>
+                ) : (
+                  contacts.map((contact) => (
+                    <tr
+                      key={contact.id}
+                      onClick={() => openContact(contact)}
+                      style={{ cursor: "pointer" }}
+                      className={rowClass(contact)}
+                      aria-selected={selected?.id === contact.id}
+                    >
+                      <td className="serial">{contact.list_number ?? "—"}</td>
+                      <td>{contact.full_name}</td>
+                      <td>{contact.primary_email}</td>
+                      <td>{contact.company_name}</td>
+                      <td>{formatDate(contact.last_contacted_at)}</td>
+                      <td>
+                        {contact.email_count} / {contact.thread_count}
+                      </td>
+                      <td>
+                        <span className={tierClass(contact.fundraising_relevance_tier)}>
+                          {contact.fundraising_relevance_tier || "low"} ({contact.fundraising_relevance_score})
+                        </span>
+                      </td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <div className="review-actions">
+                          <span className={reviewClass(contact.review_status)}>
+                            {contact.review_status}
+                          </span>
+                          <button
+                            className="review-btn approve"
+                            title="Approve — email later"
+                            onClick={() => setReviewStatus(contact.id, "approved")}
+                          >
+                            ✓
+                          </button>
+                          <button
+                            className="review-btn deny"
+                            title="Deny — not interested"
+                            onClick={() => setReviewStatus(contact.id, "denied")}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="chips">
+                          {(contact.detected_topics || []).slice(0, 3).map((topic) => (
+                            <span className="chip" key={topic}>
+                              {topic}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="preview">{contact.last_subject}</td>
+                      <td>
+                        {contact.latest_message_id ? (
+                          <a
+                            href={api.openOutlookUrl(contact.latest_message_id)}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            Open
+                          </a>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="pagination">
+            <span>
+              Showing {contacts.length} of {total.toLocaleString()} contacts
+            </span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+                Previous
+              </button>
+              <button
+                disabled={page * 50 >= total}
+                onClick={() => setPage((p) => p + 1)}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {selected && (
+          <aside className="drawer">
+            <div className="drawer-header">
+              <button className="drawer-close" onClick={() => setSelected(null)} aria-label="Close">
+                ✕
+              </button>
+              <div className="drawer-title">
+                <span className="drawer-number">#{selected.list_number}</span>
+                <h2>{selected.full_name || selected.primary_email}</h2>
+              </div>
+              <div className="drawer-meta">{selected.company_name || "—"}</div>
+              <div className="drawer-meta">{selected.primary_email}</div>
+              <div className="drawer-badges">
+                <span className={tierClass(selected.fundraising_relevance_tier)}>
+                  {selected.fundraising_relevance_tier || "low"} ({selected.fundraising_relevance_score})
+                </span>
+                <InfoTip label="How relevance tiers work">
+                  <RelevanceTierHelp />
+                </InfoTip>
+                {selected.contact_type && <span className="chip">{selected.contact_type}</span>}
+                <span className={reviewClass(selected.review_status)}>{selected.review_status}</span>
+              </div>
+              <div className="review-actions drawer-review">
+                <button className="review-btn approve" onClick={() => setReviewStatus(selected.id, "approved")}>
+                  Approve to email
+                </button>
+                <button className="review-btn deny" onClick={() => setReviewStatus(selected.id, "denied")}>
+                  Deny
+                </button>
+                {selected.review_status !== "pending" && (
+                  <button className="review-btn reset" onClick={() => setReviewStatus(selected.id, "pending")}>
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {detailLoading ? (
+              <div className="drawer-loading">Loading contact details…</div>
+            ) : (
+              <>
+                <div className="drawer-stats">
+                  <div className="drawer-stat">
+                    <span className="label">Emails</span>
+                    <span className="value">{selected.email_count}</span>
+                  </div>
+                  <div className="drawer-stat">
+                    <span className="label">Threads</span>
+                    <span className="value">{selected.thread_count}</span>
+                  </div>
+                  <div className="drawer-stat">
+                    <span className="label">First contact</span>
+                    <span className="value">{formatDate(selected.first_contacted_at)}</span>
+                  </div>
+                  <div className="drawer-stat">
+                    <span className="label">Last contact</span>
+                    <span className="value">{formatDate(selected.last_contacted_at)}</span>
+                  </div>
+                </div>
+
+                {(selected.detected_topics || []).length > 0 && (
+                  <section className="drawer-section">
+                    <h3>Topics</h3>
+                    <div className="chips">
+                      {(selected.detected_topics || []).map((topic) => (
+                        <span className="chip" key={topic}>
+                          {topic}
+                        </span>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {selected.last_subject && (
+                  <section className="drawer-section">
+                    <h3>Latest subject</h3>
+                    <p className="drawer-subject">{selected.last_subject}</p>
+                    {selected.latest_message_id && (
+                      <a href={api.openOutlookUrl(selected.latest_message_id)} target="_blank" rel="noreferrer">
+                        Open in Outlook →
+                      </a>
+                    )}
+                  </section>
+                )}
+
+                <section className="drawer-section">
+                  <h3>Last correspondence</h3>
+                  <p className="drawer-body preview-block">
+                    {selected.last_meaningful_email_preview || selected.last_preview || "No preview available."}
+                  </p>
+                </section>
+
+                {selected.score_breakdown && (
+                  <section className="drawer-section">
+                    <SectionHeading
+                      title="Score breakdown"
+                      tip={
+                        <InfoTip label="How scoring works">
+                          <ScoreBreakdownHelp />
+                        </InfoTip>
+                      }
+                    />
+                    <div className="score-grid">
+                      {Object.entries(selected.score_breakdown).map(([key, value]) => (
+                        <div className="score-item" key={key}>
+                          <span className="score-key">{key.replace(/_/g, " ")}</span>
+                          <span className={value > 0 ? "score-pos" : value < 0 ? "score-neg" : ""}>
+                            {value > 0 ? "+" : ""}
+                            {value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section className="drawer-section">
+                  <h3>AI actions</h3>
+                  <div className="ai-actions-grid">
+                    <button disabled={!!aiLoading} onClick={() => runAiAction("summary")}>
+                      {aiLoading === "summary" ? "Generating…" : selected.ai_summary ? "Regenerate Summary" : "Generate Summary"}
+                    </button>
+                    <button disabled={!!aiLoading} onClick={() => runAiAction("threads")}>
+                      {aiLoading === "threads" ? "Summarizing…" : "Deep Thread Summary"}
+                    </button>
+                  </div>
+                  {selected.ai_summary && (
+                    <div className="ai-panel">
+                      <h4>AI Summary</h4>
+                      <p style={{ whiteSpace: "pre-wrap" }}>{selected.ai_summary}</p>
+                      {selected.ai_summary_generated_at && (
+                        <small className="meta">Generated {formatDate(selected.ai_summary_generated_at)}</small>
+                      )}
+                    </div>
+                  )}
+                </section>
+
+                <section className="drawer-section">
+                  <h3>Email timeline ({messages.length})</h3>
+                  {messages.length === 0 ? (
+                    <p className="drawer-empty">No emails found for this contact.</p>
+                  ) : (
+                    messages.map((message) => (
+                      <div className="message-item" key={message.id}>
+                        <div className="date">{formatDate(message.sent_datetime)}</div>
+                        <strong>{message.subject}</strong>
+                        <p className="preview-block">{message.body_preview}</p>
+                        <a href={api.openOutlookUrl(message.id)} target="_blank" rel="noreferrer">
+                          Open in Outlook →
+                        </a>
+                      </div>
+                    ))
+                  )}
+                </section>
+              </>
+            )}
+          </aside>
+        )}
+      </div>
+    </main>
+  );
+}
