@@ -179,12 +179,49 @@ Set `NEXT_PUBLIC_API_BASE` on the **web** app **before** deploying the web zip
 bash deploy/azure-deploy.sh
 ```
 
-### Option C — GitHub Actions (recommended for updates)
+### Option C — GitHub Actions, automatic on push to `main` (recommended)
 
-1. Push repo to GitHub
-2. Azure Portal → each Web App → **Deployment Center** → GitHub
-3. Set startup to `bash startup.sh` on each app
-4. Web app: `NEXT_PUBLIC_API_BASE` must exist before first build
+`.github/workflows/deploy.yml` deploys both apps on every push to `main`, which includes
+pull-request merges. It first runs a build check, so a commit that cannot build never reaches
+Azure. You can also run it by hand from **Actions → Deploy to Azure → Run workflow**.
+
+> Do **not** use Azure Portal → Deployment Center for this repo. Its generated workflow deploys
+> the repository root, but `backend/` and `frontend/` are two separate Web Apps and each needs its
+> own subdirectory as the zip root — Azure runs `bash startup.sh` from the zip root.
+
+**One-time setup — two GitHub secrets:**
+
+1. Azure Portal → **edgeinvesting-email-contacts-api** → **Overview** → **Download publish profile**
+2. GitHub → repo → **Settings → Secrets and variables → Actions → New repository secret**
+   - Name: `AZURE_API_PUBLISH_PROFILE`
+   - Value: the entire contents of that `.PublishSettings` file (it is XML — paste all of it)
+3. Repeat for **edgeinvesting-email-contacts-web** as `AZURE_WEB_PUBLISH_PROFILE`
+
+**If "Download publish profile" is greyed out**, basic auth publishing is disabled on the app.
+Enable it, or the deploy fails with 401:
+
+```bash
+az resource update --resource-group $RESOURCE_GROUP \
+  --namespace Microsoft.Web --resource-type basicPublishingCredentialsPolicies \
+  --name scm --parent sites/$API_APP --set properties.allow=true
+
+az resource update --resource-group $RESOURCE_GROUP \
+  --namespace Microsoft.Web --resource-type basicPublishingCredentialsPolicies \
+  --name scm --parent sites/$WEB_APP --set properties.allow=true
+```
+
+Portal equivalent: each Web App → **Settings → Configuration → General settings** →
+**SCM Basic Auth Publishing Credentials** → **On**.
+
+**Still required, as with any deploy method:**
+
+- Startup command `bash startup.sh` on both apps (persists; set once)
+- `NEXT_PUBLIC_API_BASE` as an app setting on the **web** app. Next.js inlines it at build time
+  and Oryx builds on the server, so it must exist *before* the build or the frontend ships
+  pointing at `localhost:8000`.
+
+**Rolling back:** the publish profile deploys whatever is on `main`. To roll back, revert the
+commit on `main` and let the workflow run, or redeploy a previous zip with `deploy/azure-deploy.sh`.
 
 ---
 
@@ -264,7 +301,14 @@ az webapp log tail --resource-group $RESOURCE_GROUP --name $WEB_APP
 
 - [ ] Azure AD redirect URI added for production API
 - [ ] API app settings configured (secrets, FRONTEND_URL, CORS)
+- [ ] `OUTREACH_MAILBOXES` set on the API app — **no surrounding quotes**, or the JSON will not
+      parse and no mailbox will appear
+- [ ] `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` / `MICROSOFT_TENANT_ID` set on the API app
+      (app-only credentials for the mailbox that lives in another tenant)
+- [ ] `INTERNAL_DOMAINS` includes every company domain, `galaxypharma.net` included
 - [ ] Web app `NEXT_PUBLIC_API_BASE` set, then deployed/built
 - [ ] Always On enabled on both apps
-- [ ] Manager can open web URL and connect Outlook
-- [ ] First sync completed
+- [ ] `AZURE_API_PUBLISH_PROFILE` and `AZURE_WEB_PUBLISH_PROFILE` added as GitHub secrets
+- [ ] SCM basic auth publishing enabled on both apps
+- [ ] Manager can open web URL and see all three mailboxes in the dropdown
+- [ ] First sync completed for each mailbox
