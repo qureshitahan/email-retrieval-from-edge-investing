@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import init_db
-from app.routers import ai, auth, contacts, export, messages, outreach, sync
+from app.routers import ai, auth, contacts, export, mailboxes, messages, outreach, sync
 
 settings = get_settings()
 app = FastAPI(title="Relationship Intelligence CRM", version="0.1.0")
@@ -35,4 +35,5 @@ app.include_router(ai.router, prefix="/api/v1")
 app.include_router(sync.router, prefix="/api/v1")
 app.include_router(contacts.router, prefix="/api/v1")
 app.include_router(outreach.router, prefix="/api/v1")
+app.include_router(mailboxes.router, prefix="/api/v1")
 app.include_router(export.router, prefix="/api/v1")

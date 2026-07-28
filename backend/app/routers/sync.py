@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
 from app.models.sync import SyncRun
 from app.schemas import SyncRunOut
-from app.services.graph_client import GraphAuthError, GraphClient
+from app.services.mail_readers import MailReadError
+from app.services.mailboxes import Mailbox, MailboxConfigError, default_mailbox, get_mailbox
 from app.services.sync_service import SyncService, run_sync_in_background
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -14,6 +15,20 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 
 def _db_factory():
     return SessionLocal()
+
+
+def _resolve_mailbox(mailbox_id: str | None) -> Mailbox:
+    """The mailbox to sync. Falls back to the first configured one when unnamed."""
+    try:
+        mailbox = get_mailbox(mailbox_id) if mailbox_id else default_mailbox()
+    except MailboxConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if mailbox is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No mailboxes configured. Set OUTREACH_MAILBOXES in the backend .env.",
+        )
+    return mailbox
 
 
 def _run_reprocess() -> None:
@@ -31,40 +46,44 @@ def reprocess_contacts(background_tasks: BackgroundTasks):
     return {"status": "started", "message": "Re-extracting contacts from imported messages"}
 
 
-@router.post("/start-inbox", response_model=SyncRunOut)
-def start_inbox_sync(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    client = GraphClient(db)
+def _start(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    mailbox_id: str | None,
+    *,
+    inbox: bool,
+) -> SyncRun:
+    mailbox = _resolve_mailbox(mailbox_id)
     try:
-        client.ensure_access_token()
-    except GraphAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        service = SyncService(db, mailbox)
+    except MailReadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    service = SyncService(db)
     active = service.get_active_run()
     if active:
         return active
 
-    sync_run = service.start_inbox_sync()
+    sync_run = service.start_inbox_sync() if inbox else service.start_full_sync()
     background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
     return sync_run
+
+
+@router.post("/start-inbox", response_model=SyncRunOut)
+def start_inbox_sync(
+    background_tasks: BackgroundTasks,
+    mailbox_id: str | None = Query(None, description="Mailbox to sync; defaults to the first one"),
+    db: Session = Depends(get_db),
+):
+    return _start(db, background_tasks, mailbox_id, inbox=True)
 
 
 @router.post("/start", response_model=SyncRunOut)
-def start_sync(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    client = GraphClient(db)
-    try:
-        client.ensure_access_token()
-    except GraphAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-
-    service = SyncService(db)
-    active = service.get_active_run()
-    if active:
-        return active
-
-    sync_run = service.start_full_sync()
-    background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
-    return sync_run
+def start_sync(
+    background_tasks: BackgroundTasks,
+    mailbox_id: str | None = Query(None, description="Mailbox to sync; defaults to the first one"),
+    db: Session = Depends(get_db),
+):
+    return _start(db, background_tasks, mailbox_id, inbox=False)
 
 
 @router.get("/status", response_model=SyncRunOut | None)

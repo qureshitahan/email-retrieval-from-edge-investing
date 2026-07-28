@@ -28,12 +28,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Microsoft Graph / Azure AD
+    # Microsoft Graph / Azure AD — delegated (user signs in, used for reading mail)
     azure_client_id: str = ""
     azure_client_secret: str = ""
     azure_tenant_id: str = "common"
     azure_redirect_uri: str = "http://localhost:8000/api/v1/auth/callback"
     graph_scopes: str = "Mail.Read,Mail.Send,User.Read"
+
+    # Microsoft Graph — app-only (client credentials). Sends as a named mailbox with no
+    # interactive sign-in, so a mailbox in a *different* tenant than azure_tenant_id can
+    # still send. Needs the Mail.Send APPLICATION permission with admin consent granted.
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_tenant_id: str = ""
+    microsoft_send_as_user: str = ""
 
     # Database (override in Azure: sqlite:////home/data/crm.db)
     database_url: str = Field(default_factory=_default_database_url)
@@ -46,6 +54,14 @@ class Settings(BaseSettings):
     # Anthropic (MVP 4 — on-demand AI)
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-6"
+
+    # Outreach mailboxes — JSON array of sending identities.
+    # Each entry: {"id", "label", "provider", "from_email", "from_name"}
+    #   "gmail"               also takes "gmail_app_password"
+    #   "microsoft_graph"     uses the signed-in Outlook OAuth session
+    #   "microsoft_graph_app" uses the app-only microsoft_* credentials above, and may
+    #                         override them per mailbox with "client_id"/"client_secret"/"tenant_id"
+    outreach_mailboxes: str = ""
 
     # Domain config (comma-separated)
     internal_domains: str = "edgeinvesting.ca,galaxypharma.com,galaxypharma.ca,galaxypharma.net"

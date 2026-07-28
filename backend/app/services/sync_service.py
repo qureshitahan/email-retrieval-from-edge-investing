@@ -12,7 +12,8 @@ from app.services.contact_pipeline import (
     process_message_recipients,
     rebuild_contact_aggregates,
 )
-from app.services.graph_client import GraphClient
+from app.services.mail_readers import MailReader, reader_for
+from app.services.mailboxes import Mailbox, default_mailbox
 from app.services.text_utils import normalize_email, normalize_subject, parse_display_name
 
 
@@ -25,10 +26,20 @@ def _serialize_recipients(recipients: list[dict] | None) -> list[dict]:
     return serialized
 
 
-def upsert_message(db: Session, item: dict, *, direction: str = "outbound") -> tuple[EmailMessage, bool]:
+def upsert_message(
+    db: Session,
+    item: dict,
+    *,
+    direction: str = "outbound",
+    mailbox_id: str | None = None,
+) -> tuple[EmailMessage, bool]:
     graph_id = item["id"]
     existing = db.query(EmailMessage).filter(EmailMessage.graph_message_id == graph_id).one_or_none()
     if existing:
+        # A message already imported without attribution belongs to whichever mailbox first
+        # reads it; backfill rather than leaving the column NULL forever.
+        if mailbox_id and existing.mailbox_id is None:
+            existing.mailbox_id = mailbox_id
         return existing, False
 
     sender = item.get("sender") or item.get("from") or {}
@@ -58,6 +69,7 @@ def upsert_message(db: Session, item: dict, *, direction: str = "outbound") -> t
         raw_cc=_serialize_recipients(item.get("ccRecipients")),
         raw_bcc=_serialize_recipients(item.get("bccRecipients")),
         direction=direction,
+        mailbox_id=mailbox_id,
     )
     db.add(message)
     db.flush()
@@ -67,9 +79,22 @@ def upsert_message(db: Session, item: dict, *, direction: str = "outbound") -> t
 class SyncService:
     BATCH_AGGREGATE_SIZE = 250
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, mailbox: Mailbox | None = None):
         self.db = db
-        self.graph = GraphClient(db)
+        # No mailbox named -> first configured one, preserving single-mailbox behaviour.
+        self.mailbox = mailbox or default_mailbox()
+        self.reader: MailReader | None = reader_for(db, self.mailbox) if self.mailbox else None
+
+    @property
+    def mailbox_id(self) -> str | None:
+        return self.mailbox.id if self.mailbox else None
+
+    def _require_reader(self) -> MailReader:
+        if self.reader is None:
+            raise RuntimeError(
+                "No mailbox configured. Set OUTREACH_MAILBOXES in .env before syncing."
+            )
+        return self.reader
 
     def get_active_run(self) -> SyncRun | None:
         return (
@@ -79,26 +104,36 @@ class SyncService:
             .first()
         )
 
-    async def run_full_sync(self, sync_run_id: str) -> None:
+    async def _run(self, sync_run_id: str, *, inbound: bool) -> None:
+        """Page through one folder of one mailbox. Sent and inbox differ only in the reader
+        call, the message direction, and which contact-extraction step applies."""
+        reader = self._require_reader()
         sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
         touched_contact_ids: set[str] = set()
-        url = sync_run.checkpoint_url
+        cursor = sync_run.checkpoint_url
         messages_new = sync_run.messages_new
         messages_fetched = sync_run.messages_fetched
+        direction = "inbound" if inbound else "outbound"
 
         try:
             while True:
-                page = await self.graph.fetch_messages_page(url)
-                values = page.get("value", [])
-                batch_touched: list[str] = []
+                if inbound:
+                    values, next_cursor = await reader.fetch_inbox_page(cursor)
+                else:
+                    values, next_cursor = await reader.fetch_sent_page(cursor)
 
+                batch_touched: list[str] = []
                 for item in values:
-                    message, is_new = upsert_message(self.db, item)
+                    message, is_new = upsert_message(
+                        self.db, item, direction=direction, mailbox_id=self.mailbox_id
+                    )
                     messages_fetched += 1
                     if is_new:
                         messages_new += 1
-                        contact_ids = process_message_recipients(self.db, message)
-                        batch_touched.extend(contact_ids)
+                        if inbound:
+                            batch_touched.extend(process_inbound_sender(self.db, message))
+                        else:
+                            batch_touched.extend(process_message_recipients(self.db, message))
 
                 self.db.commit()
                 touched_contact_ids.update(batch_touched)
@@ -109,17 +144,18 @@ class SyncService:
 
                 sync_run.messages_fetched = messages_fetched
                 sync_run.messages_new = messages_new
-                sync_run.checkpoint_url = page.get("@odata.nextLink")
+                sync_run.checkpoint_url = next_cursor
                 self.db.commit()
 
-                url = page.get("@odata.nextLink")
-                if not url:
+                cursor = next_cursor
+                if not cursor:
                     break
 
-            if touched_contact_ids:
-                updated_count = rebuild_contact_aggregates(self.db, list(touched_contact_ids))
-            else:
-                updated_count = 0
+            updated_count = (
+                rebuild_contact_aggregates(self.db, list(touched_contact_ids))
+                if touched_contact_ids
+                else 0
+            )
 
             sync_run.status = "completed"
             sync_run.completed_at = datetime.utcnow()
@@ -131,87 +167,49 @@ class SyncService:
             sync_run.completed_at = datetime.utcnow()
             self.db.commit()
             raise
+
+    async def run_full_sync(self, sync_run_id: str) -> None:
+        await self._run(sync_run_id, inbound=False)
 
     async def run_inbox_sync(self, sync_run_id: str) -> None:
-        sync_run = self.db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
-        touched_contact_ids: set[str] = set()
-        url = sync_run.checkpoint_url
-        messages_new = sync_run.messages_new
-        messages_fetched = sync_run.messages_fetched
+        await self._run(sync_run_id, inbound=True)
 
-        try:
-            while True:
-                page = await self.graph.fetch_inbox_page(url)
-                values = page.get("value", [])
-                batch_touched: list[str] = []
-
-                for item in values:
-                    message, is_new = upsert_message(self.db, item, direction="inbound")
-                    messages_fetched += 1
-                    if is_new:
-                        messages_new += 1
-                        contact_ids = process_inbound_sender(self.db, message)
-                        batch_touched.extend(contact_ids)
-
-                self.db.commit()
-                touched_contact_ids.update(batch_touched)
-
-                if len(touched_contact_ids) >= self.BATCH_AGGREGATE_SIZE:
-                    rebuild_contact_aggregates(self.db, list(touched_contact_ids))
-                    touched_contact_ids.clear()
-
-                sync_run.messages_fetched = messages_fetched
-                sync_run.messages_new = messages_new
-                sync_run.checkpoint_url = page.get("@odata.nextLink")
-                self.db.commit()
-
-                url = page.get("@odata.nextLink")
-                if not url:
-                    break
-
-            if touched_contact_ids:
-                updated_count = rebuild_contact_aggregates(self.db, list(touched_contact_ids))
-            else:
-                updated_count = 0
-
-            sync_run.status = "completed"
-            sync_run.completed_at = datetime.utcnow()
-            sync_run.contacts_updated = updated_count
-            self.db.commit()
-        except Exception as exc:
-            sync_run.status = "failed"
-            sync_run.error_message = str(exc)
-            sync_run.completed_at = datetime.utcnow()
-            self.db.commit()
-            raise
+    def _start(self, sync_type: str) -> SyncRun:
+        active = self.get_active_run()
+        if active:
+            return active
+        sync_run = SyncRun(sync_type=sync_type, status="running", mailbox_id=self.mailbox_id)
+        self.db.add(sync_run)
+        self.db.commit()
+        self.db.refresh(sync_run)
+        return sync_run
 
     def start_inbox_sync(self) -> SyncRun:
-        active = self.get_active_run()
-        if active:
-            return active
-        sync_run = SyncRun(sync_type="inbox", status="running")
-        self.db.add(sync_run)
-        self.db.commit()
-        self.db.refresh(sync_run)
-        return sync_run
+        return self._start("inbox")
 
     def start_full_sync(self) -> SyncRun:
-        active = self.get_active_run()
-        if active:
-            return active
-
-        sync_run = SyncRun(sync_type="full", status="running")
-        self.db.add(sync_run)
-        self.db.commit()
-        self.db.refresh(sync_run)
-        return sync_run
+        return self._start("full")
 
 
 async def run_sync_in_background(db_factory, sync_run_id: str) -> None:
+    from app.services.mailboxes import get_mailbox
+
     db = db_factory()
     try:
-        service = SyncService(db)
         sync_run = db.query(SyncRun).filter(SyncRun.id == sync_run_id).one()
+        try:
+            # Resolve the mailbox from the run so a background task syncs what was requested.
+            mailbox = get_mailbox(sync_run.mailbox_id) if sync_run.mailbox_id else None
+            service = SyncService(db, mailbox)
+        except Exception as exc:
+            # Setup failures (mailbox removed from config, unsupported provider) must still mark
+            # the run finished - a run left at "running" blocks every later sync.
+            sync_run.status = "failed"
+            sync_run.error_message = str(exc)
+            sync_run.completed_at = datetime.utcnow()
+            db.commit()
+            raise
+
         if sync_run.sync_type == "inbox":
             await service.run_inbox_sync(sync_run_id)
         else:

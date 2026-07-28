@@ -35,6 +35,9 @@ class EmailMessage(Base):
     raw_cc: Mapped[list] = mapped_column(JSON, default=list)
     raw_bcc: Mapped[list] = mapped_column(JSON, default=list)
     direction: Mapped[str] = mapped_column(String(16), default="outbound", index=True)
+    # Which configured mailbox this message was read from. NULL on rows imported before
+    # multi-mailbox sync existed, which are all from the original signed-in Outlook account.
+    mailbox_id: Mapped[str | None] = mapped_column(String(64), index=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

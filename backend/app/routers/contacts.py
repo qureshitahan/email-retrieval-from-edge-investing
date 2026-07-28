@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session, joinedload
@@ -11,7 +12,19 @@ from app.models.contact import Contact, ContactContext, ContactEmailLink
 from app.models.message import EmailMessage
 from app.models.sync import SyncRun
 from app.schemas import ContactDetail, ContactListItem, ContactUpdate, StatsOut
+from app.services.graph_app_client import (
+    GRAPH_BASE,
+    GraphAppAuthError,
+    acquire_app_token,
+)
 from app.services.graph_client import GraphAuthError, GraphClient
+from app.services.mailboxes import (
+    PROVIDER_GRAPH,
+    PROVIDER_GRAPH_APP,
+    MailboxConfigError,
+    default_mailbox,
+    get_mailbox,
+)
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
 
@@ -70,6 +83,7 @@ def list_contacts(
     review_status: str | None = None,
     not_replied_days: int | None = None,
     awaiting_reply_only: bool = False,
+    mailbox_id: str | None = None,
     sort: str = "last_contacted_at",
     order: str = "desc",
     page: int = Query(1, ge=1),
@@ -111,6 +125,19 @@ def list_contacts(
         query = query.filter(Contact.review_status == review_status)
     if awaiting_reply_only:
         query = query.filter(Contact.awaiting_reply.is_(True))
+    if mailbox_id:
+        # Contacts stay shared across mailboxes - a person is one relationship. Scope by
+        # whether *this* mailbox ever corresponded with them.
+        from_mailbox = (
+            db.query(ContactEmailLink.id)
+            .join(EmailMessage, ContactEmailLink.email_message_id == EmailMessage.id)
+            .filter(
+                ContactEmailLink.contact_id == Contact.id,
+                EmailMessage.mailbox_id == mailbox_id,
+            )
+            .exists()
+        )
+        query = query.filter(from_mailbox)
     if not_replied_days is not None:
         query = query.filter(
             Contact.awaiting_reply.is_(True),
@@ -161,8 +188,46 @@ def list_contacts(
     }
 
 
+def _remote_sent_total(db: Session, mailbox_id: str | None) -> int | None:
+    """Sent-folder count straight from the provider, for the "have we imported everything?" card.
+
+    Returns None when the count cannot be obtained cheaply: Gmail would need a full IMAP login on
+    every stats call, and a delegated mailbox needs a stored sign-in. None renders as "unknown"
+    rather than as zero.
+    """
+    try:
+        mailbox = get_mailbox(mailbox_id) if mailbox_id else default_mailbox()
+    except MailboxConfigError:
+        return None
+    if mailbox is None:
+        return None
+
+    if mailbox.provider == PROVIDER_GRAPH_APP:
+        try:
+            token = acquire_app_token(mailbox.app_credentials)
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
+                response = client.get(
+                    f"{GRAPH_BASE}/users/{mailbox.from_email}/mailFolders/sentitems"
+                    "?$select=totalItemCount",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if response.status_code == 200:
+                return response.json().get("totalItemCount")
+        except (GraphAppAuthError, httpx.HTTPError):
+            return None
+        return None
+
+    if mailbox.provider == PROVIDER_GRAPH:
+        try:
+            return GraphClient(db).fetch_sent_items_folder().get("totalItemCount")
+        except (GraphAuthError, httpx.HTTPError):
+            return None
+
+    return None
+
+
 @router.get("/stats", response_model=StatsOut)
-def contact_stats(db: Session = Depends(get_db)):
+def contact_stats(mailbox_id: str | None = None, db: Session = Depends(get_db)):
     external_filter = (Contact.is_internal.is_(False), Contact.is_excluded.is_(False))
 
     total_contacts = db.query(func.count(Contact.id)).scalar() or 0
@@ -171,12 +236,12 @@ def contact_stats(db: Session = Depends(get_db)):
         db.query(func.count(Contact.id)).filter(Contact.fundraising_relevance_tier == "high").scalar() or 0
     )
     total_messages = db.query(func.count(EmailMessage.id)).scalar() or 0
-    synced_messages = (
-        db.query(func.count(EmailMessage.id))
-        .filter(~EmailMessage.graph_message_id.like("test-%"))
-        .scalar()
-        or 0
+    synced_query = db.query(func.count(EmailMessage.id)).filter(
+        ~EmailMessage.graph_message_id.like("test-%")
     )
+    if mailbox_id:
+        synced_query = synced_query.filter(EmailMessage.mailbox_id == mailbox_id)
+    synced_messages = synced_query.scalar() or 0
     review_pending = (
         db.query(func.count(Contact.id)).filter(*external_filter, Contact.review_status == "pending").scalar() or 0
     )
@@ -187,17 +252,13 @@ def contact_stats(db: Session = Depends(get_db)):
         db.query(func.count(Contact.id)).filter(*external_filter, Contact.review_status == "denied").scalar() or 0
     )
 
-    graph_sent_total: int | None = None
-    sync_complete: bool | None = None
-    try:
-        folder = GraphClient(db).fetch_sent_items_folder()
-        graph_sent_total = folder.get("totalItemCount")
-        if graph_sent_total is not None:
-            sync_complete = synced_messages >= graph_sent_total
-    except GraphAuthError:
-        pass
+    graph_sent_total = _remote_sent_total(db, mailbox_id)
+    sync_complete = synced_messages >= graph_sent_total if graph_sent_total is not None else None
 
-    last_sync = db.query(SyncRun).filter(SyncRun.status == "completed").order_by(SyncRun.completed_at.desc()).first()
+    last_sync_query = db.query(SyncRun).filter(SyncRun.status == "completed")
+    if mailbox_id:
+        last_sync_query = last_sync_query.filter(SyncRun.mailbox_id == mailbox_id)
+    last_sync = last_sync_query.order_by(SyncRun.completed_at.desc()).first()
     return StatsOut(
         total_contacts=total_contacts,
         external_contacts=external_contacts,
@@ -233,6 +294,7 @@ def get_contact(contact_id: str, db: Session = Depends(get_db)):
         last_meaningful_email_preview=context.last_meaningful_email_preview if context else None,
         meaningful_previews=context.meaningful_previews if context else None,
         ai_summary=context.ai_summary if context else None,
+        ai_relationship_context=context.ai_relationship_context if context else None,
         ai_follow_up_draft=context.ai_follow_up_draft if context else None,
         ai_contact_classification=context.ai_contact_classification if context else None,
         ai_summary_generated_at=context.ai_summary_generated_at if context else None,

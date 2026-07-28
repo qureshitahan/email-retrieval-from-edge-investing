@@ -92,6 +92,34 @@ def run_migrations() -> None:
                 conn.execute(
                     text("ALTER TABLE email_messages ADD COLUMN direction VARCHAR(16) DEFAULT 'outbound'")
                 )
+            if "mailbox_id" not in msg_columns:
+                conn.execute(text("ALTER TABLE email_messages ADD COLUMN mailbox_id VARCHAR(64)"))
+                conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS ix_email_messages_mailbox_id "
+                         "ON email_messages (mailbox_id)")
+                )
+
+    if "sync_runs" in inspector.get_table_names():
+        run_columns = {column["name"] for column in inspector.get_columns("sync_runs")}
+        with engine.begin() as conn:
+            if "mailbox_id" not in run_columns:
+                conn.execute(text("ALTER TABLE sync_runs ADD COLUMN mailbox_id VARCHAR(64)"))
+                conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS ix_sync_runs_mailbox_id "
+                         "ON sync_runs (mailbox_id)")
+                )
+
+    if "contact_context" in inspector.get_table_names():
+        ctx_columns = {column["name"] for column in inspector.get_columns("contact_context")}
+        with engine.begin() as conn:
+            if "ai_relationship_context" not in ctx_columns:
+                conn.execute(text("ALTER TABLE contact_context ADD COLUMN ai_relationship_context TEXT"))
+
+    if "email_drafts" in inspector.get_table_names():
+        draft_columns = {column["name"] for column in inspector.get_columns("email_drafts")}
+        with engine.begin() as conn:
+            if "sending_mailbox_id" not in draft_columns:
+                conn.execute(text("ALTER TABLE email_drafts ADD COLUMN sending_mailbox_id VARCHAR(64)"))
 
     if "contacts" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("contacts")}
