@@ -70,6 +70,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # azure/webapps-deploy reports both a missing secret and a profile with no MSDeploy
+      # entry as the same opaque "does not contain kudu URL". Check first and say which.
+      # Only the length and yes/no answers are printed - never the profile itself.
+      - name: Check publish profile secret
+        env:
+          PROFILE: ${{ secrets.AZURE_API_PUBLISH_PROFILE }}
+        run: |
+          if [ -z "$PROFILE" ]; then
+            echo "::error::Secret AZURE_API_PUBLISH_PROFILE is empty or does not exist. Add it under Settings > Secrets and variables > Actions. The name must match exactly."
+            exit 1
+          fi
+          echo "secret is present, ${#PROFILE} characters"
+          if ! printf '%s' "$PROFILE" | grep -q 'publishMethod="MSDeploy"'; then
+            echo "::error::The publish profile has no MSDeploy entry, so there is no kudu URL to deploy to. Enabling SCM basic auth does not repair an already-downloaded file: re-download the publish profile from the Web App Overview page AFTER enabling it, then replace this secret with the new file's full contents."
+            exit 1
+          fi
+          echo "MSDeploy entry found - profile looks usable"
+
       # Only backend/ is shipped. Azure runs `bash startup.sh` from the zip root, so
       # the zip root must be the backend directory, not the repository root.
       - name: Deploy backend to Azure Web App
@@ -105,6 +123,21 @@ jobs:
       url: ${{ steps.deploy.outputs.webapp-url }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check publish profile secret
+        env:
+          PROFILE: ${{ secrets.AZURE_WEB_PUBLISH_PROFILE }}
+        run: |
+          if [ -z "$PROFILE" ]; then
+            echo "::error::Secret AZURE_WEB_PUBLISH_PROFILE is empty or does not exist. Add it under Settings > Secrets and variables > Actions. The name must match exactly."
+            exit 1
+          fi
+          echo "secret is present, ${#PROFILE} characters"
+          if ! printf '%s' "$PROFILE" | grep -q 'publishMethod="MSDeploy"'; then
+            echo "::error::The publish profile has no MSDeploy entry, so there is no kudu URL to deploy to. Enabling SCM basic auth does not repair an already-downloaded file: re-download the publish profile from the Web App Overview page AFTER enabling it, then replace this secret with the new file's full contents."
+            exit 1
+          fi
+          echo "MSDeploy entry found - profile looks usable"
 
       # node_modules and .next are gitignored, so Oryx installs and builds on the
       # server. NEXT_PUBLIC_API_BASE is inlined at build time, which means it must be

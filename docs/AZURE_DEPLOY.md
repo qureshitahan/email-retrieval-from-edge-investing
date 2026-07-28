@@ -197,6 +197,19 @@ Azure. You can also run it by hand from **Actions → Deploy to Azure → Run wo
    - Value: the entire contents of that `.PublishSettings` file (it is XML — paste all of it)
 3. Repeat for **edgeinvesting-email-contacts-web** as `AZURE_WEB_PUBLISH_PROFILE`
 
+**Deploy fails with `Publish profile does not contain kudu URL`?**
+
+The profile was read but has no `MSDeploy` entry, so there is nothing to deploy to. Azure omits
+that entry when **SCM basic auth publishing is disabled** at download time, leaving only FTP.
+
+The important part: **enabling SCM basic auth does not repair a file you already downloaded, nor
+the GitHub secret holding it.** The order must be enable → re-download → replace the secret. The
+workflow now checks this before attempting a deploy and says which of the two problems it is
+(secret missing vs. no MSDeploy entry).
+
+To confirm by hand, open the `.PublishSettings` file and search for `publishMethod="MSDeploy"`.
+If the only method present is `FTP`, the file was downloaded while basic auth was off.
+
 **If "Download publish profile" is greyed out**, basic auth publishing is disabled on the app.
 Enable it, or the deploy fails with 401:
 
