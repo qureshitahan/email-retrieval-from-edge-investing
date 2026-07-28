@@ -5,6 +5,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.services.ai_service import AIServiceError
+from app.services.mailboxes import MailboxConfigError, load_mailboxes
+from app.services.prioritization import prioritize_contacts
 from app.services.outreach_service import (
     OutreachError,
     draft_to_dict,
@@ -14,6 +17,7 @@ from app.services.outreach_service import (
     list_drafts,
     send_approved_drafts,
     send_draft,
+    set_draft_mailbox,
     update_draft,
     update_prompt_config,
 )
@@ -29,16 +33,56 @@ class PromptUpdate(BaseModel):
 class GenerateDraftsRequest(BaseModel):
     contact_ids: list[str] = []
     custom_instructions: str | None = None
+    objective: str | None = None
 
 
 class SingleGenerateRequest(BaseModel):
     custom_instructions: str | None = None
+    objective: str | None = None
 
 
 class DraftUpdate(BaseModel):
     subject: str | None = None
     body: str | None = None
     status: str | None = None
+
+
+class SendingMailboxIn(BaseModel):
+    mailbox_id: str
+
+
+class SendIn(BaseModel):
+    mailbox_id: str | None = None
+
+
+class PrioritizeRequest(BaseModel):
+    objective: str
+    contact_ids: list[str] = []
+    limit: int = 25
+
+
+@router.get("/mailboxes")
+def get_mailboxes():
+    """Configured sending identities (no secrets)."""
+    try:
+        mailboxes = load_mailboxes()
+    except MailboxConfigError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"items": [m.public_dict() for m in mailboxes]}
+
+
+@router.post("/prioritize")
+def post_prioritize(payload: PrioritizeRequest, db: Session = Depends(get_db)):
+    """Rank contacts against an objective (e.g. "board seat"), best-first."""
+    try:
+        return prioritize_contacts(
+            db,
+            objective=payload.objective,
+            contact_ids=payload.contact_ids or None,
+            limit=payload.limit,
+        )
+    except AIServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/prompt")
@@ -68,12 +112,20 @@ async def post_generate_drafts(payload: GenerateDraftsRequest, db: Session = Dep
     if len(payload.contact_ids) == 1:
         try:
             draft = await generate_draft_for_contact(
-                db, payload.contact_ids[0], custom_instructions=payload.custom_instructions
+                db,
+                payload.contact_ids[0],
+                custom_instructions=payload.custom_instructions,
+                objective=payload.objective,
             )
             return {"items": [draft_to_dict(draft)]}
         except OutreachError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    results = await generate_drafts_bulk(db, payload.contact_ids, custom_instructions=payload.custom_instructions)
+    results = await generate_drafts_bulk(
+        db,
+        payload.contact_ids,
+        custom_instructions=payload.custom_instructions,
+        objective=payload.objective,
+    )
     draft_ids = [r["draft_id"] for r in results if r.get("draft_id")]
     drafts = list_drafts(db)
     by_id = {d.id: d for d in drafts}
@@ -88,8 +140,11 @@ async def post_generate_for_contact(
     db: Session = Depends(get_db),
 ):
     instructions = payload.custom_instructions if payload else None
+    objective = payload.objective if payload else None
     try:
-        draft = await generate_draft_for_contact(db, contact_id, custom_instructions=instructions)
+        draft = await generate_draft_for_contact(
+            db, contact_id, custom_instructions=instructions, objective=objective
+        )
         return draft_to_dict(draft)
     except OutreachError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -113,15 +168,28 @@ def approve_draft(draft_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/drafts/{draft_id}/send")
-async def post_send_draft(draft_id: str, db: Session = Depends(get_db)):
+@router.post("/drafts/{draft_id}/sending-mailbox")
+def post_draft_sending_mailbox(draft_id: str, payload: SendingMailboxIn, db: Session = Depends(get_db)):
     try:
-        draft = await send_draft(db, draft_id)
+        draft = set_draft_mailbox(db, draft_id, payload.mailbox_id)
+        return draft_to_dict(draft)
+    except OutreachError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/drafts/{draft_id}/send")
+async def post_send_draft(
+    draft_id: str,
+    payload: SendIn | None = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        draft = await send_draft(db, draft_id, mailbox_id=payload.mailbox_id if payload else None)
         return draft_to_dict(draft)
     except OutreachError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/drafts/send-approved")
-async def post_send_approved(db: Session = Depends(get_db)):
-    return {"results": await send_approved_drafts(db)}
+async def post_send_approved(payload: SendIn | None = None, db: Session = Depends(get_db)):
+    return {"results": await send_approved_drafts(db, mailbox_id=payload.mailbox_id if payload else None)}

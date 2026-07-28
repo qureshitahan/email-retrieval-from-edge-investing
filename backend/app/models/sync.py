@@ -32,6 +32,8 @@ class SyncRun(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     sync_type: Mapped[str] = mapped_column(String(16), default="full")
     status: Mapped[str] = mapped_column(String(16), default="running", index=True)
+    # Which mailbox this run read from; NULL for runs predating multi-mailbox sync.
+    mailbox_id: Mapped[str | None] = mapped_column(String(64), index=True)
     messages_fetched: Mapped[int] = mapped_column(Integer, default=0)
     messages_new: Mapped[int] = mapped_column(Integer, default=0)
     contacts_updated: Mapped[int] = mapped_column(Integer, default=0)

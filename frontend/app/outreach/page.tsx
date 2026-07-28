@@ -1,13 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { MailboxPicker } from "@/components/MailboxPicker";
 import { Nav } from "@/components/Nav";
 import {
   api,
   Contact,
   EmailDraft,
   formatDate,
+  MailboxStatus,
   OutreachPrompt,
+  RankedContact,
   SyncRun,
 } from "@/lib/api";
 
@@ -19,12 +22,17 @@ export default function OutreachPage() {
   } | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
+  const [mailboxes, setMailboxes] = useState<MailboxStatus[]>([]);
+  const [sendFrom, setSendFrom] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [activeDraft, setActiveDraft] = useState<EmailDraft | null>(null);
   const [prompt, setPrompt] = useState<OutreachPrompt | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userTemplate, setUserTemplate] = useState("");
   const [customInstructions, setCustomInstructions] = useState("");
+  const [objective, setObjective] = useState("");
+  const [ranked, setRanked] = useState<RankedContact[] | null>(null);
+  const [ranking, setRanking] = useState(false);
   const [notRepliedDays, setNotRepliedDays] = useState("");
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -50,11 +58,15 @@ export default function OutreachPage() {
         params.not_replied_days = Number(notRepliedDays);
         params.awaiting_reply_only = true;
       }
-      const [authStatus, contactData, draftData, promptData] = await Promise.all([
+      const [authStatus, contactData, draftData, promptData, mailboxData] = await Promise.all([
         api.authStatus(),
         api.contacts(params),
         api.listDrafts(),
         api.getOutreachPrompt(),
+        // A bad OUTREACH_MAILBOXES value must not take the whole page down.
+        api
+          .mailboxStatuses()
+          .catch(() => ({ items: [] as MailboxStatus[], config_error: null })),
       ]);
       setAuth(authStatus);
       setContacts(contactData.items);
@@ -62,6 +74,12 @@ export default function OutreachPage() {
       setPrompt(promptData);
       setSystemPrompt(promptData.system_prompt);
       setUserTemplate(promptData.user_prompt_template);
+      setMailboxes(mailboxData.items);
+      // Keep the user's pick across reloads; fall back to the first sendable mailbox.
+      setSendFrom((prev) => {
+        if (prev && mailboxData.items.some((m) => m.id === prev && m.can_send)) return prev;
+        return mailboxData.items.find((m) => m.can_send)?.id || "";
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load outreach data");
     } finally {
@@ -119,7 +137,11 @@ export default function OutreachPage() {
     setGenerating(true);
     setError(null);
     try {
-      const result = await api.generateDrafts(ids, customInstructions || undefined);
+      const result = await api.generateDrafts(
+        ids,
+        customInstructions || undefined,
+        objective || undefined
+      );
       await loadAll();
       if (result.items.length > 0) setActiveDraft(result.items[0]);
       if (result.results?.some((r) => r.status === "error")) {
@@ -158,12 +180,47 @@ export default function OutreachPage() {
     }
   }
 
+  async function handlePrioritize() {
+    if (!objective.trim()) {
+      setError("Enter an objective first — that is what the ranking is judged against");
+      return;
+    }
+    setRanking(true);
+    setError(null);
+    try {
+      // Rank the selected contacts if any are ticked, otherwise the strongest candidates.
+      const result = await api.prioritize(objective.trim(), Array.from(selected), 25);
+      setRanked(result.items);
+      if (result.scored === 0) {
+        setError("The model returned no usable scores. Try again or narrow the objective.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Prioritization failed");
+    } finally {
+      setRanking(false);
+    }
+  }
+
+  async function handleChooseMailbox(mailboxId: string) {
+    setSendFrom(mailboxId);
+    if (!activeDraft || !mailboxId) return;
+    // Persist the choice on the draft so a later bulk send uses the same identity.
+    try {
+      const updated = await api.setDraftMailbox(activeDraft.id, mailboxId);
+      setActiveDraft(updated);
+      setDrafts((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to set sending mailbox");
+    }
+  }
+
   async function handleSendDraft() {
     if (!activeDraft) return;
     setSending(true);
     setError(null);
     try {
-      const updated = await api.sendDraft(activeDraft.id);
+      const updated = await api.sendDraft(activeDraft.id, activeMailboxId || undefined);
       setActiveDraft(updated);
       await loadAll();
     } catch (err) {
@@ -177,7 +234,7 @@ export default function OutreachPage() {
     setSending(true);
     setError(null);
     try {
-      const result = await api.sendApprovedDrafts();
+      const result = await api.sendApprovedDrafts(sendFrom || undefined);
       const failed = result.results.filter((r) => r.status === "error");
       if (failed.length) setError(`Some sends failed: ${failed.map((f) => f.error).join("; ")}`);
       setActiveDraft(null);
@@ -192,7 +249,7 @@ export default function OutreachPage() {
   async function handleInboxSync() {
     setError(null);
     try {
-      const run = await api.startInboxSync();
+      const run = await api.startInboxSync(sendFrom || undefined);
       setSync(run);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Inbox sync failed to start");
@@ -200,6 +257,12 @@ export default function OutreachPage() {
   }
 
   const approvedDraftCount = drafts.filter((d) => d.status === "approved").length;
+  // The draft's own saved identity wins; otherwise fall back to the page-level pick.
+  const activeMailboxId = activeDraft?.sending_mailbox_id || sendFrom;
+  const activeMailbox = mailboxes.find((m) => m.id === activeMailboxId) || null;
+  const sendableMailboxes = mailboxes.filter((m) => m.can_send);
+  // The backend reports readiness per transport; app-only and Gmail never need a sign-in.
+  const blockedMailbox = activeMailbox != null && !activeMailbox.can_send;
 
   return (
     <main className="page">
@@ -213,19 +276,20 @@ export default function OutreachPage() {
           </p>
         </div>
         <div className="actions">
-          {!auth?.connected ? (
-            <a className="button primary" href={api.loginUrl()}>
-              Connect Microsoft Outlook
+          <button onClick={handleInboxSync} disabled={sync?.status === "running"}>
+            {sync?.status === "running" && sync.sync_type === "inbox"
+              ? "Syncing inbox…"
+              : "Sync Inbox (replies)"}
+          </button>
+          {/* Shown only for a mailbox that genuinely cannot avoid the interactive sign-in. */}
+          {mailboxes.some((m) => m.needs_signin) && (
+            <a
+              className="button"
+              href={api.loginUrl()}
+              title={mailboxes.find((m) => m.needs_signin)?.detail}
+            >
+              Sign in to {mailboxes.find((m) => m.needs_signin)?.from_email}
             </a>
-          ) : (
-            <>
-              <a className="button" href={api.loginUrl()} title="Reconnect after adding Mail.Send in Azure">
-                Reconnect Outlook
-              </a>
-              <button onClick={handleInboxSync} disabled={sync?.status === "running"}>
-                {sync?.status === "running" && sync.sync_type === "inbox" ? "Syncing inbox…" : "Sync Inbox (replies)"}
-              </button>
-            </>
           )}
         </div>
       </div>
@@ -237,24 +301,34 @@ export default function OutreachPage() {
         </div>
       )}
 
-      {auth?.connected && auth.can_send_mail && (
-        <div className="banner success">
-          Outlook connected with send permission. You can generate drafts and send emails from here. Use{" "}
-          <strong>Sync Inbox</strong> to track who has not replied.
+      {mailboxes.length > 0 && (
+        <div className={`banner ${sendableMailboxes.length === mailboxes.length ? "success" : "info"}`}>
+          <strong>
+            {sendableMailboxes.length} of {mailboxes.length} mailboxes ready to send
+          </strong>
+          {sendableMailboxes.length > 0 && `: ${sendableMailboxes.map((m) => m.from_email).join(", ")}. `}
+          Pick the sending identity per draft below. Use <strong>Sync Inbox</strong> to track who has
+          not replied.
         </div>
       )}
 
-      {auth?.connected && !auth.can_send_mail && (
-        <div className="banner error">
-          Connected as {auth.user_email}, but <strong>Mail.Send</strong> is not in your session yet. Click{" "}
-          <strong>Reconnect Outlook</strong>, sign in as dbains@edgeinvesting.ca, and accept all permissions. If
-          it still fails, restart the backend and reconnect again.
-        </div>
-      )}
-
-      {!auth?.connected && (
-        <div className="banner info">
-          Connect Microsoft Outlook to draft and send fundraising emails.
+      {mailboxes.length > 0 && (
+        <div className="outreach-panel" style={{ marginTop: 16 }}>
+          <div className="panel-header">
+            <h2>Sending mailboxes ({mailboxes.length})</h2>
+          </div>
+          <div className="mailbox-strip">
+            {mailboxes.map((m) => (
+              <div key={m.id} className={`mailbox-card${m.can_send ? " ready" : " blocked"}`}>
+                <strong>{m.label}</strong>
+                <span className="email">{m.from_email}</span>
+                <span className={`draft-status ${m.can_send ? "approved" : "error"}`}>
+                  {m.can_send ? "Ready to send" : "Cannot send yet"}
+                </span>
+                <span className="meta">{m.detail}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -327,6 +401,62 @@ export default function OutreachPage() {
           )}
 
           <label>
+            Objective — what are you trying to get out of this outreach?
+            <input
+              placeholder="e.g. board seat, Series A raise, distribution partner…"
+              value={objective}
+              onChange={(e) => setObjective(e.target.value)}
+            />
+            <small className="meta">
+              Used to judge who matters and why. Left blank, drafts fall back to general relationship
+              context.
+            </small>
+          </label>
+
+          <div className="actions">
+            <button onClick={handlePrioritize} disabled={ranking || !objective.trim()}>
+              {ranking ? "Ranking…" : "Prioritize contacts for this objective"}
+            </button>
+            {ranked && (
+              <button className="link-btn" onClick={() => setRanked(null)}>
+                Clear ranking
+              </button>
+            )}
+          </div>
+
+          {ranked && (
+            <div className="ranked-list">
+              <strong className="picker-label">
+                Ranked for “{objective}” — best first
+              </strong>
+              {ranked.map((r, i) => (
+                <label
+                  key={r.contact_id}
+                  className={`ranked-item${selected.has(r.contact_id) ? " selected" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(r.contact_id)}
+                    onChange={() => toggleContact(r.contact_id)}
+                  />
+                  <span className="rank">{i + 1}</span>
+                  <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
+                    {r.objective_score === null ? "—" : r.objective_score}
+                  </span>
+                  <span className="who">
+                    <strong>{r.full_name || r.primary_email}</strong>
+                    {r.company_name ? ` · ${r.company_name}` : ""}
+                    {r.review_status !== "approved" && (
+                      <em className="not-approved"> (approve before drafting)</em>
+                    )}
+                    <span className="why">{r.reason || "No score returned for this contact."}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          <label>
             Optional instructions for this batch (tone, angle, specifics)
             <textarea
               rows={3}
@@ -354,8 +484,25 @@ export default function OutreachPage() {
         <div className="panel-header">
           <h2>Drafts ({drafts.length})</h2>
           <div className="actions">
+            {sendableMailboxes.length > 1 && (
+              <select
+                value={sendFrom}
+                onChange={(e) => setSendFrom(e.target.value)}
+                title="Default sending mailbox for drafts that do not have one set"
+              >
+                {sendableMailboxes.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    Send from: {m.from_email}
+                  </option>
+                ))}
+              </select>
+            )}
             {approvedDraftCount > 0 && (
-              <button className="primary" onClick={handleSendAllApproved} disabled={sending}>
+              <button
+                className="primary"
+                onClick={handleSendAllApproved}
+                disabled={sending || sendableMailboxes.length === 0}
+              >
                 Send all approved ({approvedDraftCount})
               </button>
             )}
@@ -420,13 +567,29 @@ export default function OutreachPage() {
                 </div>
               )}
 
+              <MailboxPicker
+                mailboxes={mailboxes}
+                value={activeMailboxId}
+                onChange={handleChooseMailbox}
+                label="Send from"
+                capability="send"
+              />
+
               <div className="actions">
                 <button onClick={handleSaveDraft}>Save edits</button>
                 <button onClick={handleApproveDraft} disabled={activeDraft.status === "approved"}>
                   Approve draft
                 </button>
-                <button className="primary" onClick={handleSendDraft} disabled={sending}>
-                  {sending ? "Sending…" : "Send via Outlook"}
+                <button
+                  className="primary"
+                  onClick={handleSendDraft}
+                  disabled={sending || sendableMailboxes.length === 0 || blockedMailbox}
+                >
+                  {sending
+                    ? "Sending…"
+                    : activeMailbox
+                      ? `Send as ${activeMailbox.from_email}`
+                      : "Send"}
                 </button>
               </div>
               {activeDraft.error_message && (

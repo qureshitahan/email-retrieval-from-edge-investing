@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from sqlalchemy.orm import Session, joinedload
@@ -7,13 +8,62 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.outreach import EmailDraft, OutreachPrompt
 from app.services.ai_service import _call_anthropic, build_metadata_context, _contact_messages, _get_contact
 from app.services.graph_client import GraphAuthError, GraphClient
+from app.services.relationship_context import build_relationship_evidence, format_relationship_evidence
+from app.services.mail_sender import MailSendError, send_via_mailbox
+from app.services.mailboxes import MailboxConfigError, default_mailbox, get_mailbox
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You write professional, warm fundraising outreach emails for Edge Investing / Galaxy Pharma. "
-    "Personalize based on prior correspondence. Never invent facts not supported by the contact data."
+    "You write outreach emails for Edge Investing / Galaxy Pharma.\n\n"
+    "The context you are given labels every past message with who wrote it — either WE WROTE "
+    "or THEY WROTE. Read those labels carefully. Attributing our own words to the recipient, "
+    "or theirs to us, produces an email that cannot be sent, so treat the distinction as the "
+    "most important thing in the brief.\n\n"
+    "Never invent facts. Do not state a job title, employer, deal, mutual contact, meeting, or "
+    "commitment that is not present in the context. If you have nothing specific to reference, "
+    "write a brief and honest note rather than a padded one.\n\n"
+    "Never mention email volume, thread counts, or how long it has been since you last spoke. "
+    "Those are internal metrics, not things one writes to a person."
 )
 
-DEFAULT_USER_PROMPT_TEMPLATE = """Draft a fundraising outreach email to this contact.
+DEFAULT_USER_PROMPT_TEMPLATE = """Draft a short outreach email to this contact.
+
+How to use the context:
+- Anchor the email on the most recent message THEY wrote, when there is one. That is the live
+  thread in their mind. Continue it; do not restart the conversation.
+- If they have never replied, do not imply a dialogue or shared history that did not happen.
+- Reference at most one or two concrete specifics (a named deal, company, or workstream) that
+  appear verbatim in the context. Precision beats warmth here.
+- If the context is genuinely thin, keep the email short and general rather than inventing detail.
+
+Requirements:
+- Professional and warm, but direct. No filler openings.
+- One clear ask, phrased as a low-friction next step.
+- Body under 160 words. Shorter is better.
+- No placeholders like [Name] or [Company] — use the real values or omit the sentence.
+- Sign off as "Best regards" with no name (the sender adds their own signature).
+
+{custom_instructions_block}
+
+Return ONLY in this format, with nothing before or after:
+Subject: <subject line>
+
+<body paragraphs>
+
+=== CONTEXT ===
+{context}"""
+
+# Stock prompts from earlier versions. A row still holding one of these has never been edited
+# by the user, so it is safe to upgrade in place; anything else is a deliberate customisation
+# and is left untouched.
+_LEGACY_SYSTEM_PROMPTS = {
+    (
+        "You write professional, warm fundraising outreach emails for Edge Investing / Galaxy Pharma. "
+        "Personalize based on prior correspondence. Never invent facts not supported by the contact data."
+    ),
+}
+
+_LEGACY_USER_PROMPTS = {
+    """Draft a fundraising outreach email to this contact.
 
 Requirements:
 - Professional, warm, personalized tone
@@ -31,32 +81,72 @@ Subject: <subject line>
 <body paragraphs>
 
 Contact context:
-{context}"""
+{context}""",
+}
 
 
 class OutreachError(Exception):
     pass
 
 
+_PREAMBLE_MARKERS = ("here is", "here's", "sure,", "certainly", "of course", "i've drafted", "draft:")
+
+
 def _parse_draft_response(text: str) -> tuple[str, str]:
-    lines = text.strip().splitlines()
-    subject = ""
-    body_lines: list[str] = []
+    """Split a model response into (subject, body).
+
+    Tolerates a leading conversational preamble, markdown fences, and bolded labels. Falls
+    back to using the first line as the subject only when it looks like a subject rather
+    than prose, so a stray sentence never silently becomes the subject line.
+    """
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+
+    lines = cleaned.splitlines()
+
     for i, line in enumerate(lines):
-        if line.lower().startswith("subject:"):
-            subject = line.split(":", 1)[1].strip()
-            body_lines = lines[i + 1 :]
-            break
-    if not subject and lines:
-        subject = lines[0].strip()
-        body_lines = lines[1:]
-    body = "\n".join(body_lines).strip()
-    return subject, body
+        # Handles "Subject:", "**Subject:**", "### Subject:" etc.
+        stripped = line.strip().lstrip("#*> ").rstrip("*").strip()
+        if stripped.lower().startswith("subject:"):
+            subject = stripped.split(":", 1)[1].strip().strip("*").strip()
+            body = "\n".join(lines[i + 1 :]).strip()
+            # Strips "Body:", "**Body:**", "*Body*:" — asterisks may sit either side of the colon.
+            body = re.sub(r"^\**\s*body\s*\**\s*:\s*\**\s*", "", body, flags=re.IGNORECASE).strip()
+            return subject, body
+
+    # No explicit Subject: label. Drop any preamble line, then take the first short,
+    # non-terminated line as the subject — long or punctuated lines are prose, not subjects.
+    candidates = [ln for ln in lines if ln.strip()]
+    if candidates and any(candidates[0].strip().lower().startswith(m) for m in _PREAMBLE_MARKERS):
+        candidates = candidates[1:]
+    if not candidates:
+        return "", cleaned
+
+    first = candidates[0].strip()
+    if len(first) <= 120 and not first.endswith((".", "!", "?")):
+        return first, "\n".join(candidates[1:]).strip()
+
+    # Whole response is prose — keep it all as the body and let the caller/user set a subject.
+    return "", "\n".join(candidates).strip()
 
 
 def get_or_create_prompt(db: Session) -> OutreachPrompt:
     row = db.query(OutreachPrompt).filter(OutreachPrompt.id == "default").one_or_none()
     if row:
+        # Upgrade never-edited stock prompts; preserve anything the user has customised.
+        upgraded = False
+        if (row.system_prompt or "").strip() in {p.strip() for p in _LEGACY_SYSTEM_PROMPTS}:
+            row.system_prompt = DEFAULT_SYSTEM_PROMPT
+            upgraded = True
+        if (row.user_prompt_template or "").strip() in {p.strip() for p in _LEGACY_USER_PROMPTS}:
+            row.user_prompt_template = DEFAULT_USER_PROMPT_TEMPLATE
+            upgraded = True
+        if upgraded:
+            row.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(row)
         return row
     row = OutreachPrompt(
         id="default",
@@ -100,11 +190,24 @@ def build_user_prompt(
     return template.replace("{custom_instructions_block}", block).replace("{context}", context)
 
 
+def build_draft_context(db: Session, contact, messages) -> str:
+    """Grounding for a draft: relationship evidence first, then the labelled message log.
+
+    The evidence block separates the last message *from them* and the last message *from us*,
+    which is what the draft needs to continue the right conversation.
+    """
+    sections = [format_relationship_evidence(build_relationship_evidence(db, contact))]
+    if messages:
+        sections.append(build_metadata_context(contact, messages))
+    return "\n\n".join(sections)
+
+
 async def generate_draft_for_contact(
     db: Session,
     contact_id: str,
     *,
     custom_instructions: str | None = None,
+    objective: str | None = None,
 ) -> EmailDraft:
     contact = _get_contact(db, contact_id)
     if contact.review_status != "approved":
@@ -112,8 +215,14 @@ async def generate_draft_for_contact(
 
     prompt_row = get_or_create_prompt(db)
     messages = _contact_messages(db, contact_id)
-    context = build_metadata_context(contact, messages)
-    user_prompt = build_user_prompt(prompt_row.user_prompt_template, context, custom_instructions)
+    context = build_draft_context(db, contact, messages)
+
+    instructions = custom_instructions
+    if objective and objective.strip():
+        goal = f"The purpose of this outreach: {objective.strip()}"
+        instructions = f"{goal}\n{custom_instructions.strip()}" if custom_instructions else goal
+
+    user_prompt = build_user_prompt(prompt_row.user_prompt_template, context, instructions)
 
     raw = _call_anthropic(prompt_row.system_prompt, user_prompt)
     subject, body = _parse_draft_response(raw)
@@ -128,7 +237,7 @@ async def generate_draft_for_contact(
     draft.subject = subject
     draft.body = body
     draft.status = "draft"
-    draft.custom_instructions = custom_instructions
+    draft.custom_instructions = instructions
     draft.system_prompt = prompt_row.system_prompt
     draft.user_prompt = user_prompt
     draft.error_message = None
@@ -145,11 +254,14 @@ async def generate_drafts_bulk(
     contact_ids: list[str],
     *,
     custom_instructions: str | None = None,
+    objective: str | None = None,
 ) -> list[dict]:
     results: list[dict] = []
     for contact_id in contact_ids:
         try:
-            draft = await generate_draft_for_contact(db, contact_id, custom_instructions=custom_instructions)
+            draft = await generate_draft_for_contact(
+                db, contact_id, custom_instructions=custom_instructions, objective=objective
+            )
             results.append({"contact_id": contact_id, "draft_id": draft.id, "status": "ok"})
         except Exception as exc:
             results.append({"contact_id": contact_id, "status": "error", "error": str(exc)})
@@ -178,6 +290,7 @@ def draft_to_dict(draft: EmailDraft) -> dict:
         "subject": draft.subject,
         "body": draft.body,
         "status": draft.status,
+        "sending_mailbox_id": draft.sending_mailbox_id,
         "custom_instructions": draft.custom_instructions,
         "system_prompt": draft.system_prompt,
         "user_prompt": draft.user_prompt,
@@ -204,7 +317,37 @@ def update_draft(db: Session, draft_id: str, *, subject: str | None, body: str |
     return draft
 
 
-async def send_draft(db: Session, draft_id: str) -> EmailDraft:
+def set_draft_mailbox(db: Session, draft_id: str, mailbox_id: str) -> EmailDraft:
+    """Pin which configured mailbox a draft will send from."""
+    draft = db.query(EmailDraft).filter(EmailDraft.id == draft_id).one_or_none()
+    if not draft:
+        raise OutreachError("Draft not found")
+    try:
+        mailbox = get_mailbox(mailbox_id)
+    except MailboxConfigError as exc:
+        raise OutreachError(str(exc)) from exc
+    if not mailbox.can_send:
+        raise OutreachError(f"Mailbox {mailbox.id!r} is not able to send (missing credentials)")
+    draft.sending_mailbox_id = mailbox.id
+    draft.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def _resolve_send_mailbox(draft: EmailDraft, mailbox_id: str | None):
+    """Pick the mailbox for a send: explicit arg → pinned on draft → first configured.
+
+    Returns None when no mailboxes are configured at all, which keeps the original
+    single-account Outlook send path working unchanged.
+    """
+    chosen = mailbox_id or draft.sending_mailbox_id
+    if chosen:
+        return get_mailbox(chosen)
+    return default_mailbox()
+
+
+async def send_draft(db: Session, draft_id: str, *, mailbox_id: str | None = None) -> EmailDraft:
     draft = (
         db.query(EmailDraft)
         .options(joinedload(EmailDraft.contact))
@@ -221,15 +364,35 @@ async def send_draft(db: Session, draft_id: str) -> EmailDraft:
     if not draft.subject or not draft.body:
         raise OutreachError("Draft is missing subject or body")
 
-    graph = GraphClient(db)
     try:
-        await graph.send_mail(
-            to_email=contact.primary_email,
-            to_name=contact.full_name,
-            subject=draft.subject,
-            body=draft.body,
-        )
-    except GraphAuthError as exc:
+        mailbox = _resolve_send_mailbox(draft, mailbox_id)
+    except MailboxConfigError as exc:
+        draft.error_message = str(exc)
+        draft.updated_at = datetime.utcnow()
+        db.commit()
+        raise OutreachError(str(exc)) from exc
+
+    try:
+        if mailbox is None:
+            # No OUTREACH_MAILBOXES configured — original behaviour: send as the signed-in user.
+            graph = GraphClient(db)
+            await graph.send_mail(
+                to_email=contact.primary_email,
+                to_name=contact.full_name,
+                subject=draft.subject,
+                body=draft.body,
+            )
+        else:
+            await send_via_mailbox(
+                db,
+                mailbox,
+                to_email=contact.primary_email,
+                to_name=contact.full_name,
+                subject=draft.subject,
+                body=draft.body,
+            )
+            draft.sending_mailbox_id = mailbox.id
+    except (GraphAuthError, MailSendError) as exc:
         draft.error_message = str(exc)
         draft.updated_at = datetime.utcnow()
         db.commit()
@@ -244,13 +407,13 @@ async def send_draft(db: Session, draft_id: str) -> EmailDraft:
     return draft
 
 
-async def send_approved_drafts(db: Session) -> list[dict]:
+async def send_approved_drafts(db: Session, *, mailbox_id: str | None = None) -> list[dict]:
     drafts = db.query(EmailDraft).filter(EmailDraft.status == "approved").all()
     results: list[dict] = []
     for draft in drafts:
         try:
-            await send_draft(db, draft.id)
-            results.append({"draft_id": draft.id, "status": "sent"})
+            sent = await send_draft(db, draft.id, mailbox_id=mailbox_id)
+            results.append({"draft_id": draft.id, "status": "sent", "mailbox_id": sent.sending_mailbox_id})
         except Exception as exc:
             results.append({"draft_id": draft.id, "status": "error", "error": str(exc)})
     return results

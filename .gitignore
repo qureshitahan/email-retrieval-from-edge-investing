@@ -6,3 +6,4 @@ frontend/.next/
 __pycache__/
 *.pyc
 .DS_Store
+frontend/tsconfig.tsbuildinfo

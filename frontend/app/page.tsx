@@ -7,17 +7,22 @@ import {
   Contact,
   ContactDetail,
   formatDate,
+  MailboxStatus,
   Stats,
   SyncRun,
   tierClass,
   reviewClass,
 } from "@/lib/api";
 import { InfoTip, SectionHeading } from "@/components/InfoTip";
+import { MailboxPicker } from "@/components/MailboxPicker";
 import { Nav } from "@/components/Nav";
 import { RelevanceTierHelp, ScoreBreakdownHelp } from "@/lib/helpText";
 
 export default function HomePage() {
-  const [auth, setAuth] = useState<{ connected: boolean; user_email: string | null } | null>(null);
+  // Connection state comes from /mailboxes now — it covers all three transports, not just the
+  // interactive Outlook sign-in that /auth/status reports on.
+  const [mailboxes, setMailboxes] = useState<MailboxStatus[]>([]);
+  const [activeMailbox, setActiveMailbox] = useState("");
   const [stats, setStats] = useState<Stats | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [total, setTotal] = useState(0);
@@ -37,14 +42,16 @@ export default function HomePage() {
   const [fundraisingTier, setFundraisingTier] = useState("");
   const [emailCountMin, setEmailCountMin] = useState("");
   const [reviewFilter, setReviewFilter] = useState("");
+  // Selecting a mailbox scopes the list to that mailbox's contacts. This is the escape hatch
+  // for seeing everyone at once, including messages imported before mailbox attribution existed.
+  const [showAllMailboxes, setShowAllMailboxes] = useState(false);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [authStatus, statsData, contactData, syncData] = await Promise.all([
-        api.authStatus(),
-        api.stats(),
+      const [statsData, contactData, syncData, mailboxData] = await Promise.all([
+        api.stats(showAllMailboxes ? undefined : activeMailbox || undefined),
         api.contacts({
           page,
           page_size: 50,
@@ -54,22 +61,32 @@ export default function HomePage() {
           review_status: reviewFilter,
           exclude_internal: true,
           exclude_noise: true,
+          mailbox_id: showAllMailboxes ? "" : activeMailbox,
           sort: "list_number",
           order: "asc",
         }),
         api.syncStatus(),
+        // Mailbox readiness must not be able to break the contacts list.
+        api.mailboxStatuses().catch(() => ({ items: [] as MailboxStatus[], config_error: null })),
       ]);
-      setAuth(authStatus);
       setStats(statsData);
       setContacts(contactData.items);
       setTotal(contactData.total);
       setSync(syncData);
+      setMailboxes(mailboxData.items);
+      setActiveMailbox((prev) => {
+        if (prev && mailboxData.items.some((m) => m.id === prev)) return prev;
+        // Prefer one that needs no user action; otherwise just show the first.
+        return (
+          mailboxData.items.find((m) => m.connected)?.id || mailboxData.items[0]?.id || ""
+        );
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load data");
     } finally {
       setLoading(false);
     }
-  }, [page, q, fundraisingTier, emailCountMin, reviewFilter]);
+  }, [page, q, fundraisingTier, emailCountMin, reviewFilter, showAllMailboxes, activeMailbox]);
 
   useEffect(() => {
     loadAll();
@@ -92,11 +109,23 @@ export default function HomePage() {
     setSyncing(true);
     setError(null);
     try {
-      const run = await api.startSync();
+      const run = await api.startSync(activeMailbox || undefined);
       setSync(run);
     } catch (err) {
       setSyncing(false);
       setError(err instanceof Error ? err.message : "Sync failed to start");
+    }
+  }
+
+  async function handleInboxSync() {
+    setSyncing(true);
+    setError(null);
+    try {
+      const run = await api.startInboxSync(activeMailbox || undefined);
+      setSync(run);
+    } catch (err) {
+      setSyncing(false);
+      setError(err instanceof Error ? err.message : "Inbox sync failed to start");
     }
   }
 
@@ -109,7 +138,9 @@ export default function HomePage() {
       if (selected?.id === contactId) {
         setSelected(updated);
       }
-      const statsData = await api.stats();
+      const statsData = await api.stats(
+        showAllMailboxes ? undefined : activeMailbox || undefined
+      );
       setStats(statsData);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update review status");
@@ -172,6 +203,10 @@ export default function HomePage() {
     }
   }
 
+  const selectedMailbox = mailboxes.find((m) => m.id === activeMailbox) || null;
+  const readableMailboxes = mailboxes.filter((m) => m.can_read);
+  const signInMailbox = mailboxes.find((m) => m.needs_signin) || null;
+
   return (
     <main className="page">
       <div className="header">
@@ -180,18 +215,38 @@ export default function HomePage() {
           <h1 style={{ marginTop: 12 }}>Relationship Intelligence CRM</h1>
           <p>
             Outlook Sent Items → contacts, context, and fundraising relevance
-            {auth?.connected && auth.user_email ? ` · ${auth.user_email}` : ""}
+            {selectedMailbox ? ` · ${selectedMailbox.from_email}` : ""}
           </p>
         </div>
         <div className="actions">
-          {!auth?.connected ? (
-            <a className="button primary" href={api.loginUrl()}>
-              Connect Microsoft Outlook
+          <MailboxPicker
+            mailboxes={mailboxes}
+            value={activeMailbox}
+            onChange={setActiveMailbox}
+            capability="read"
+            compact
+          />
+          <button
+            className="primary"
+            onClick={handleSync}
+            disabled={syncing || sync?.status === "running" || !selectedMailbox?.can_read}
+            title={selectedMailbox?.detail}
+          >
+            {sync?.status === "running" ? "Syncing…" : "Sync Sent Items"}
+          </button>
+          <button
+            onClick={handleInboxSync}
+            disabled={syncing || sync?.status === "running" || !selectedMailbox?.can_read}
+            title={selectedMailbox?.detail}
+          >
+            Sync Inbox
+          </button>
+          {/* Shown whenever ANY mailbox needs the sign-in, not just the selected one - otherwise
+              it hides itself exactly when the user is looking for it. */}
+          {signInMailbox && (
+            <a className="button primary" href={api.loginUrl()} title={signInMailbox.detail}>
+              Sign in to {signInMailbox.from_email}
             </a>
-          ) : (
-            <button className="primary" onClick={handleSync} disabled={syncing || sync?.status === "running"}>
-              {sync?.status === "running" ? "Syncing…" : "Sync Sent Items"}
-            </button>
           )}
           <a className="button" href={api.exportXlsxUrl()}>
             Export Excel
@@ -203,6 +258,24 @@ export default function HomePage() {
       </div>
 
       {error && <div className="banner error">{error}</div>}
+
+      {mailboxes.length > 0 && readableMailboxes.length < mailboxes.length && (
+        <div className="banner info">
+          <strong>
+            {readableMailboxes.length} of {mailboxes.length} mailboxes can be synced.
+          </strong>
+          <ul className="banner-list">
+            {mailboxes
+              .filter((m) => !m.can_read)
+              .map((m) => (
+                <li key={m.id}>
+                  <strong>{m.from_email}</strong> — {m.detail}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
+
       {sync?.status === "running" && (
         <div className="banner info">
           Sync in progress: {sync.messages_fetched.toLocaleString()} messages fetched,{" "}
@@ -306,6 +379,22 @@ export default function HomePage() {
                 <option value="approved">Approved</option>
                 <option value="denied">Denied</option>
               </select>
+              {mailboxes.length > 1 && (
+                <label
+                  className="inline-check"
+                  title="By default the list shows only the selected mailbox's contacts"
+                >
+                  <input
+                    type="checkbox"
+                    checked={showAllMailboxes}
+                    onChange={(e) => {
+                      setPage(1);
+                      setShowAllMailboxes(e.target.checked);
+                    }}
+                  />
+                  Show all mailboxes
+                </label>
+              )}
             </div>
           </div>
 
@@ -334,7 +423,17 @@ export default function HomePage() {
                 ) : contacts.length === 0 ? (
                   <tr>
                     <td colSpan={11}>
-                      No contacts yet. Connect Outlook and run a sync to import Sent Items.
+                      {!showAllMailboxes && selectedMailbox ? (
+                        <>
+                          No contacts from <strong>{selectedMailbox.from_email}</strong> yet.{" "}
+                          {selectedMailbox.can_read
+                            ? "Click Sync Sent Items to import them."
+                            : selectedMailbox.detail}{" "}
+                          Tick <strong>Show all mailboxes</strong> to see contacts from the others.
+                        </>
+                      ) : (
+                        "No contacts yet. Pick a mailbox and run a sync to import Sent Items."
+                      )}
                     </td>
                   </tr>
                 ) : (

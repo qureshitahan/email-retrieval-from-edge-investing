@@ -45,6 +45,7 @@ class ContactDetail(ContactListItem):
     last_meaningful_email_preview: str | None = None
     meaningful_previews: list[str] | None = None
     ai_summary: str | None = None
+    ai_relationship_context: str | None = None
     ai_follow_up_draft: str | None = None
     ai_contact_classification: dict | None = None
     ai_summary_generated_at: datetime | None = None
@@ -64,6 +65,7 @@ class SyncRunOut(BaseModel):
     id: str
     sync_type: str
     status: str
+    mailbox_id: str | None = None
     messages_fetched: int
     messages_new: int
     contacts_updated: int

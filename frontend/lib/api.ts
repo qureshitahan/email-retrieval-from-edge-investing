@@ -66,6 +66,7 @@ export type SyncRun = {
   id: string;
   sync_type: string;
   status: string;
+  mailbox_id: string | null;
   messages_fetched: number;
   messages_new: number;
   contacts_updated: number;
@@ -83,6 +84,7 @@ export type EmailDraft = {
   subject: string | null;
   body: string | null;
   status: string;
+  sending_mailbox_id: string | null;
   custom_instructions: string | null;
   system_prompt: string | null;
   user_prompt: string | null;
@@ -90,6 +92,39 @@ export type EmailDraft = {
   sent_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type Mailbox = {
+  id: string;
+  label: string;
+  provider: string;
+  from_email: string;
+  from_name: string | null;
+  can_send: boolean;
+  auth_hint: string;
+};
+
+/** A contact scored against an objective. `objective_score` is null when unscored. */
+export type RankedContact = {
+  contact_id: string;
+  list_number: number | null;
+  full_name: string | null;
+  primary_email: string;
+  company_name: string | null;
+  review_status: string;
+  baseline_score: number;
+  objective_score: number | null;
+  reason: string | null;
+};
+
+/** A mailbox plus live readiness — `connected` means usable with no user action. */
+export type MailboxStatus = Mailbox & {
+  status: "ready" | "needs_signin" | "needs_consent" | "not_configured" | "error";
+  can_read: boolean;
+  connected: boolean;
+  needs_signin: boolean;
+  requires_interactive_auth: boolean;
+  detail: string;
 };
 
 export type OutreachPrompt = {
@@ -125,7 +160,10 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   authStatus: () => apiFetch<AuthStatus>("/auth/status"),
-  stats: () => apiFetch<Stats>("/contacts/stats"),
+  stats: (mailboxId?: string) =>
+    apiFetch<Stats>(
+      `/contacts/stats${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`
+    ),
   contacts: (params: Record<string, string | number | boolean>) => {
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => {
@@ -152,8 +190,15 @@ export const api = {
         has_attachments: boolean;
       }>
     >(`/contacts/${id}/messages`),
-  startSync: () => apiFetch<SyncRun>("/sync/start", { method: "POST" }),
-  startInboxSync: () => apiFetch<SyncRun>("/sync/start-inbox", { method: "POST" }),
+  startSync: (mailboxId?: string) =>
+    apiFetch<SyncRun>(`/sync/start${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`, {
+      method: "POST",
+    }),
+  startInboxSync: (mailboxId?: string) =>
+    apiFetch<SyncRun>(
+      `/sync/start-inbox${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`,
+      { method: "POST" }
+    ),
   syncStatus: () => apiFetch<SyncRun | null>("/sync/status"),
   loginUrl: () => `${API_BASE}/auth/login`,
   getOutreachPrompt: () => apiFetch<OutreachPrompt>("/outreach/prompt"),
@@ -161,27 +206,57 @@ export const api = {
     apiFetch<OutreachPrompt>("/outreach/prompt", { method: "PATCH", body: JSON.stringify(data) }),
   listDrafts: (status?: string) =>
     apiFetch<{ items: EmailDraft[] }>(`/outreach/drafts${status ? `?status=${status}` : ""}`),
-  generateDrafts: (contactIds: string[], customInstructions?: string) =>
+  mailboxes: () => apiFetch<{ items: Mailbox[] }>("/outreach/mailboxes"),
+  prioritize: (objective: string, contactIds: string[] = [], limit = 25) =>
+    apiFetch<{ objective: string; scored: number; items: RankedContact[] }>(
+      "/outreach/prioritize",
+      {
+        method: "POST",
+        body: JSON.stringify({ objective, contact_ids: contactIds, limit }),
+      }
+    ),
+  /** Mailboxes with live readiness — drives the mailbox dropdown on both pages. */
+  mailboxStatuses: (refresh = false) =>
+    apiFetch<{ items: MailboxStatus[]; config_error: string | null; sendable?: string[] }>(
+      `/mailboxes?refresh=${refresh}`
+    ),
+  generateDrafts: (contactIds: string[], customInstructions?: string, objective?: string) =>
     apiFetch<{ items: EmailDraft[]; results?: Array<{ contact_id: string; status: string; error?: string }> }>(
       "/outreach/drafts/generate",
       {
         method: "POST",
-        body: JSON.stringify({ contact_ids: contactIds, custom_instructions: customInstructions || null }),
+        body: JSON.stringify({
+          contact_ids: contactIds,
+          custom_instructions: customInstructions || null,
+          objective: objective || null,
+        }),
       }
     ),
-  generateDraftForContact: (contactId: string, customInstructions?: string) =>
+  generateDraftForContact: (contactId: string, customInstructions?: string, objective?: string) =>
     apiFetch<EmailDraft>(`/outreach/contacts/${contactId}/generate`, {
       method: "POST",
-      body: JSON.stringify({ custom_instructions: customInstructions || null }),
+      body: JSON.stringify({
+        custom_instructions: customInstructions || null,
+        objective: objective || null,
+      }),
     }),
   updateDraft: (id: string, data: { subject?: string; body?: string; status?: string }) =>
     apiFetch<EmailDraft>(`/outreach/drafts/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   approveDraft: (id: string) => apiFetch<EmailDraft>(`/outreach/drafts/${id}/approve`, { method: "POST" }),
-  sendDraft: (id: string) => apiFetch<EmailDraft>(`/outreach/drafts/${id}/send`, { method: "POST" }),
-  sendApprovedDrafts: () =>
+  setDraftMailbox: (id: string, mailboxId: string) =>
+    apiFetch<EmailDraft>(`/outreach/drafts/${id}/sending-mailbox`, {
+      method: "POST",
+      body: JSON.stringify({ mailbox_id: mailboxId }),
+    }),
+  sendDraft: (id: string, mailboxId?: string) =>
+    apiFetch<EmailDraft>(`/outreach/drafts/${id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ mailbox_id: mailboxId || null }),
+    }),
+  sendApprovedDrafts: (mailboxId?: string) =>
     apiFetch<{ results: Array<{ draft_id: string; status: string; error?: string }> }>(
       "/outreach/drafts/send-approved",
-      { method: "POST" }
+      { method: "POST", body: JSON.stringify({ mailbox_id: mailboxId || null }) }
     ),
   exportXlsxUrl: () => `${API_BASE}/export/contacts.xlsx`,
   exportCsvUrl: () => `${API_BASE}/export/contacts.csv`,
@@ -202,6 +277,14 @@ export const api = {
     apiFetch<AIResult>(`/contacts/${id}/ai/classify?force=${force}`, { method: "POST" }),
   aiSummarizeThreads: (id: string, force = false) =>
     apiFetch<AIResult>(`/contacts/${id}/ai/summarize-threads?force=${force}`, { method: "POST" }),
+  aiRelationship: (id: string, force = false, objective?: string) => {
+    const qs = new URLSearchParams({ force: String(force) });
+    if (objective) qs.set("objective", objective);
+    return apiFetch<{ relationship_context: string; cached: boolean; generated_at?: string | null }>(
+      `/contacts/${id}/ai/relationship?${qs.toString()}`,
+      { method: "POST" }
+    );
+  },
 };
 
 export function formatDate(value: string | null) {

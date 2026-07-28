@@ -21,6 +21,7 @@ class EmailDraft(Base):
     subject: Mapped[str | None] = mapped_column(Text)
     body: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    sending_mailbox_id: Mapped[str | None] = mapped_column(String(64))
     custom_instructions: Mapped[str | None] = mapped_column(Text)
     system_prompt: Mapped[str | None] = mapped_column(Text)
     user_prompt: Mapped[str | None] = mapped_column(Text)
