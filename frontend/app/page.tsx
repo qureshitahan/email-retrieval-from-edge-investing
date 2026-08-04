@@ -35,6 +35,7 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
   const [aiLoading, setAiLoading] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
@@ -65,7 +66,7 @@ export default function HomePage() {
           sort: "list_number",
           order: "asc",
         }),
-        api.syncStatus(),
+        api.syncStatus(activeMailbox || undefined),
         // Mailbox readiness must not be able to break the contacts list.
         api.mailboxStatuses().catch(() => ({ items: [] as MailboxStatus[], config_error: null })),
       ]);
@@ -94,8 +95,10 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!sync || sync.status !== "running") return;
+    // Poll the run we actually started, not whichever run happens to be newest.
+    const polledMailbox = sync.mailbox_id || undefined;
     const timer = setInterval(async () => {
-      const status = await api.syncStatus();
+      const status = await api.syncStatus(polledMailbox);
       setSync(status);
       if (status?.status !== "running") {
         setSyncing(false);
@@ -126,6 +129,26 @@ export default function HomePage() {
     } catch (err) {
       setSyncing(false);
       setError(err instanceof Error ? err.message : "Inbox sync failed to start");
+    }
+  }
+
+  async function handleBackfill() {
+    if (!selectedMailbox) return;
+    setBackfilling(true);
+    setError(null);
+    try {
+      const result = await api.backfillMailbox(selectedMailbox.id);
+      await loadAll();
+      setError(
+        `Attributed ${result.messages_updated.toLocaleString()} messages to ${result.from_email}.` +
+          (result.messages_still_unattributed
+            ? ` ${result.messages_still_unattributed.toLocaleString()} still unattributed.`
+            : "")
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Backfill failed");
+    } finally {
+      setBackfilling(false);
     }
   }
 
@@ -258,6 +281,22 @@ export default function HomePage() {
       </div>
 
       {error && <div className="banner error">{error}</div>}
+
+      {stats && stats.unattributed_messages > 0 && selectedMailbox && (
+        <div className="banner info">
+          <strong>{stats.unattributed_messages.toLocaleString()} messages</strong> were imported
+          before per-mailbox tracking existed, so they belong to no mailbox and are hidden unless{" "}
+          <strong>Show all mailboxes</strong> is ticked. They came from the one Outlook account that
+          could be connected at the time.
+          <div className="actions" style={{ marginTop: 8 }}>
+            <button onClick={handleBackfill} disabled={backfilling}>
+              {backfilling
+                ? "Attributing…"
+                : `Attribute them to ${selectedMailbox.from_email}`}
+            </button>
+          </div>
+        </div>
+      )}
 
       {mailboxes.length > 0 && readableMailboxes.length < mailboxes.length && (
         <div className="banner info">

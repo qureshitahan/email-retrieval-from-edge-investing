@@ -255,6 +255,12 @@ def contact_stats(mailbox_id: str | None = None, db: Session = Depends(get_db)):
     graph_sent_total = _remote_sent_total(db, mailbox_id)
     sync_complete = synced_messages >= graph_sent_total if graph_sent_total is not None else None
 
+    # Rows imported before mailbox_id existed. They disappear from a mailbox-filtered list
+    # even though their contacts are still there, so the UI needs to be able to say so.
+    unattributed_messages = (
+        db.query(func.count(EmailMessage.id)).filter(EmailMessage.mailbox_id.is_(None)).scalar() or 0
+    )
+
     last_sync_query = db.query(SyncRun).filter(SyncRun.status == "completed")
     if mailbox_id:
         last_sync_query = last_sync_query.filter(SyncRun.mailbox_id == mailbox_id)
@@ -267,6 +273,7 @@ def contact_stats(mailbox_id: str | None = None, db: Session = Depends(get_db)):
         synced_messages=synced_messages,
         graph_sent_total=graph_sent_total,
         sync_complete=sync_complete,
+        unattributed_messages=unattributed_messages,
         review_pending=review_pending,
         review_approved=review_approved,
         review_denied=review_denied,

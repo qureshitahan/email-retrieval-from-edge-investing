@@ -94,7 +94,7 @@ export default function OutreachPage() {
   useEffect(() => {
     if (!sync || sync.status !== "running") return;
     const timer = setInterval(async () => {
-      const status = await api.syncStatus();
+      const status = await api.syncStatus(sync?.mailbox_id || undefined);
       setSync(status);
       if (status?.status !== "running") loadAll();
     }, 3000);

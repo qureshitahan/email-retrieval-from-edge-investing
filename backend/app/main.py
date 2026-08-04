@@ -23,6 +23,20 @@ app.add_middleware(
 def on_startup() -> None:
     init_db()
 
+    # A sync runs as a BackgroundTask, so it dies with the process. Any row still marked
+    # "running" now belongs to a restart or crash, and left alone it blocks every future
+    # sync because the start guard treats it as in flight.
+    from app.database import SessionLocal
+    from app.services.sync_service import reap_interrupted_runs
+
+    db = SessionLocal()
+    try:
+        reaped = reap_interrupted_runs(db)
+        if reaped:
+            print(f"[startup] marked {reaped} interrupted sync run(s) as failed")
+    finally:
+        db.close()
+
 
 @app.get("/api/v1/health")
 def health():
