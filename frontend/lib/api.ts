@@ -56,6 +56,7 @@ export type Stats = {
   synced_messages: number;
   graph_sent_total: number | null;
   sync_complete: boolean | null;
+  unattributed_messages: number;
   review_pending: number;
   review_approved: number;
   review_denied: number;
@@ -199,7 +200,21 @@ export const api = {
       `/sync/start-inbox${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`,
       { method: "POST" }
     ),
-  syncStatus: () => apiFetch<SyncRun | null>("/sync/status"),
+  syncStatus: (mailboxId?: string) =>
+    apiFetch<SyncRun | null>(
+      `/sync/status${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`
+    ),
+  backfillMailbox: (mailboxId: string) =>
+    apiFetch<{
+      mailbox_id: string;
+      from_email: string;
+      messages_updated: number;
+      sync_runs_updated: number;
+      messages_still_unattributed: number;
+    }>("/sync/backfill-mailbox", {
+      method: "POST",
+      body: JSON.stringify({ mailbox_id: mailboxId }),
+    }),
   loginUrl: () => `${API_BASE}/auth/login`,
   getOutreachPrompt: () => apiFetch<OutreachPrompt>("/outreach/prompt"),
   saveOutreachPrompt: (data: { system_prompt?: string; user_prompt_template?: string }) =>

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
+from app.models.message import EmailMessage
 from app.models.sync import SyncRun
 from app.schemas import SyncRunOut
 from app.services.mail_readers import MailReadError
 from app.services.mailboxes import Mailbox, MailboxConfigError, default_mailbox, get_mailbox
-from app.services.sync_service import SyncService, run_sync_in_background
+from app.services.sync_service import (
+    SyncAlreadyRunning,
+    SyncService,
+    run_sync_in_background,
+)
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
@@ -59,12 +65,16 @@ def _start(
     except MailReadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    active = service.get_active_run()
-    if active:
-        return active
+    already_running = service.get_active_run() is not None
+    try:
+        sync_run = service.start_inbox_sync() if inbox else service.start_full_sync()
+    except SyncAlreadyRunning as exc:
+        # 409: the request was valid, another mailbox just holds the write lock.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    sync_run = service.start_inbox_sync() if inbox else service.start_full_sync()
-    background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
+    # Only attach a worker for a genuinely new run, or a second worker would race the first.
+    if not already_running:
+        background_tasks.add_task(run_sync_in_background, _db_factory, sync_run.id)
     return sync_run
 
 
@@ -87,9 +97,56 @@ def start_sync(
 
 
 @router.get("/status", response_model=SyncRunOut | None)
-def latest_sync_status(db: Session = Depends(get_db)):
-    run = db.query(SyncRun).order_by(SyncRun.started_at.desc()).first()
-    return run
+def latest_sync_status(
+    mailbox_id: str | None = Query(None, description="Scope to one mailbox's runs"),
+    db: Session = Depends(get_db),
+):
+    """Latest run, optionally for one mailbox.
+
+    Without the filter the UI showed another mailbox's progress next to the mailbox you had
+    selected, which read as "your sync is running" when it was not.
+    """
+    query = db.query(SyncRun)
+    if mailbox_id:
+        query = query.filter(SyncRun.mailbox_id == mailbox_id)
+    return query.order_by(SyncRun.started_at.desc()).first()
+
+
+class BackfillRequest(BaseModel):
+    mailbox_id: str
+
+
+@router.post("/backfill-mailbox")
+def backfill_mailbox(payload: BackfillRequest, db: Session = Depends(get_db)):
+    """Attribute pre-multi-mailbox rows to a mailbox.
+
+    Messages imported before ``mailbox_id`` existed have NULL there, so they vanish the moment
+    the contact list is filtered by mailbox even though the contacts are still present. Those
+    rows all came from the one Outlook account that could be connected at the time; naming
+    which mailbox that was is a decision for the caller, not a guess this code should make.
+    """
+    mailbox = _resolve_mailbox(payload.mailbox_id)
+
+    updated = (
+        db.query(EmailMessage)
+        .filter(EmailMessage.mailbox_id.is_(None))
+        .update({EmailMessage.mailbox_id: mailbox.id}, synchronize_session=False)
+    )
+    runs_updated = (
+        db.query(SyncRun)
+        .filter(SyncRun.mailbox_id.is_(None))
+        .update({SyncRun.mailbox_id: mailbox.id}, synchronize_session=False)
+    )
+    db.commit()
+    return {
+        "mailbox_id": mailbox.id,
+        "from_email": mailbox.from_email,
+        "messages_updated": updated,
+        "sync_runs_updated": runs_updated,
+        "messages_still_unattributed": db.query(EmailMessage)
+        .filter(EmailMessage.mailbox_id.is_(None))
+        .count(),
+    }
 
 
 @router.get("/runs", response_model=list[SyncRunOut])

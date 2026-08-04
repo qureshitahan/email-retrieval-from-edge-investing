@@ -91,6 +91,8 @@ class StatsOut(BaseModel):
     synced_messages: int
     graph_sent_total: int | None = None
     sync_complete: bool | None = None
+    # Messages imported before multi-mailbox sync; invisible under a mailbox filter.
+    unattributed_messages: int = 0
     review_pending: int
     review_approved: int
     review_denied: int

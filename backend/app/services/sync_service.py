@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -76,6 +76,45 @@ def upsert_message(
     return message, True
 
 
+class SyncAlreadyRunning(Exception):
+    """Another mailbox is mid-sync. Raised instead of silently returning that other run."""
+
+
+# A sync of ~14k messages finishes in minutes, so anything still "running" after this long
+# is wedged rather than slow. Only used as a safety net; the real cleanup is at startup.
+STALE_RUN_HOURS = 2
+
+
+def reap_interrupted_runs(db: Session, *, older_than: datetime | None = None) -> int:
+    """Mark rows still saying "running" as failed. Returns how many were reaped.
+
+    A sync is a FastAPI BackgroundTask, so it cannot outlive the process. Any row still marked
+    running belongs to a process that is gone - an App Service restart, a deploy, or a crash.
+    Left alone it blocks every future sync, because the start guard sees an active run and
+    hands it back instead of starting work.
+
+    Called with no ``older_than`` this reaps every running row, which is correct **only at
+    startup**, where no sync can legitimately be in flight yet. Passing ``older_than`` limits
+    it to rows that began before that moment, which is what a running server must use - a
+    blanket reap there would kill the sync it just started.
+    """
+    query = db.query(SyncRun).filter(SyncRun.status == "running")
+    if older_than is not None:
+        query = query.filter(SyncRun.started_at < older_than)
+
+    stale = query.all()
+    for run in stale:
+        run.status = "failed"
+        run.error_message = (
+            "Interrupted - the server restarted or the sync stalled while it was running. "
+            "Start it again."
+        )
+        run.completed_at = datetime.utcnow()
+    if stale:
+        db.commit()
+    return len(stale)
+
+
 class SyncService:
     BATCH_AGGREGATE_SIZE = 250
 
@@ -96,13 +135,16 @@ class SyncService:
             )
         return self.reader
 
-    def get_active_run(self) -> SyncRun | None:
-        return (
-            self.db.query(SyncRun)
-            .filter(SyncRun.status == "running")
-            .order_by(SyncRun.started_at.desc())
-            .first()
-        )
+    def get_active_run(self, *, any_mailbox: bool = False) -> SyncRun | None:
+        """The in-flight run for this mailbox, or for any mailbox when asked.
+
+        Scoping to the mailbox matters: a global check made clicking Sync on mailbox B return
+        mailbox A's run, so the UI reported "Syncing..." while B never synced at all.
+        """
+        query = self.db.query(SyncRun).filter(SyncRun.status == "running")
+        if not any_mailbox:
+            query = query.filter(SyncRun.mailbox_id == self.mailbox_id)
+        return query.order_by(SyncRun.started_at.desc()).first()
 
     async def _run(self, sync_run_id: str, *, inbound: bool) -> None:
         """Page through one folder of one mailbox. Sent and inbox differ only in the reader
@@ -175,9 +217,28 @@ class SyncService:
         await self._run(sync_run_id, inbound=True)
 
     def _start(self, sync_type: str) -> SyncRun:
-        active = self.get_active_run()
-        if active:
-            return active
+        # Only clear runs old enough to be wedged. A blanket reap here would fail the run
+        # this very method started moments ago, which then let a second click create a
+        # duplicate and stopped the other-mailbox guard from ever firing.
+        reap_interrupted_runs(
+            self.db, older_than=datetime.utcnow() - timedelta(hours=STALE_RUN_HOURS)
+        )
+
+        mine = self.get_active_run()
+        if mine:
+            return mine
+
+        # One writer at a time: the database is SQLite, and concurrent syncs would contend
+        # for the write lock. Say which mailbox is busy rather than returning its run as if
+        # it were the one that was asked for.
+        other = self.get_active_run(any_mailbox=True)
+        if other:
+            raise SyncAlreadyRunning(
+                f"A {other.sync_type} sync is already running for mailbox "
+                f"{other.mailbox_id or 'unknown'} ({other.messages_fetched} messages fetched so "
+                "far). Wait for it to finish, then start this one."
+            )
+
         sync_run = SyncRun(sync_type=sync_type, status="running", mailbox_id=self.mailbox_id)
         self.db.add(sync_run)
         self.db.commit()
