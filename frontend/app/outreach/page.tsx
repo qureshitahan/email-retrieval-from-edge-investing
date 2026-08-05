@@ -33,6 +33,13 @@ export default function OutreachPage() {
   const [objective, setObjective] = useState("");
   const [ranked, setRanked] = useState<RankedContact[] | null>(null);
   const [ranking, setRanking] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [scanSummary, setScanSummary] = useState<string | null>(null);
+  const [scanDepth, setScanDepth] = useState(200);
+  // How many of the ranked results to show and preselect. A rank cut rather than a score
+  // threshold: the model marks more harshly in bigger batches, so a fixed score can return
+  // nothing at deeper scans while the ordering stays sound.
+  const [shortlistSize, setShortlistSize] = useState(25);
   const [notRepliedDays, setNotRepliedDays] = useState("");
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -187,17 +194,59 @@ export default function OutreachPage() {
     }
     setRanking(true);
     setError(null);
+    setRanked(null);
     try {
-      // Rank the selected contacts if any are ticked, otherwise the strongest candidates.
-      const result = await api.prioritize(objective.trim(), Array.from(selected), 25);
+      // Scans the whole contact base, not just people already approved — finding who
+      // matters is the first step, approving them is the second.
+      const result = await api.prioritize(objective.trim(), [], scanDepth, shortlistSize);
       setRanked(result.items);
-      if (result.scored === 0) {
-        setError("The model returned no usable scores. Try again or narrow the objective.");
+      setScanSummary(
+        `Scanned ${result.scanned.toLocaleString()} contacts in ${result.batches} batch(es), ` +
+          `showing the top ${result.items.length}` +
+          (result.failed_batches ? ` — ${result.failed_batches} batch(es) failed` : "")
+      );
+      // Preselect the shortlist so one click approves it. Deliberately not everything
+      // scanned — the deep tail contains newsletters and calendar senders.
+      setSelected(new Set(result.items.map((r) => r.contact_id)));
+      if (result.items.length === 0) {
+        setError("No contacts came back for this objective. Try scanning deeper.");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Prioritization failed");
     } finally {
       setRanking(false);
+    }
+  }
+
+  async function handleBulkApprove() {
+    const ids = ranked
+      ? ranked.filter((r) => selected.has(r.contact_id)).map((r) => r.contact_id)
+      : Array.from(selected);
+    if (ids.length === 0) {
+      setError("Tick at least one person to approve");
+      return;
+    }
+    setApproving(true);
+    setError(null);
+    try {
+      const result = await api.bulkReview(ids, "approved");
+      // Reflect the new status in place so the warning labels clear immediately.
+      setRanked((prev) =>
+        prev
+          ? prev.map((r) =>
+              ids.includes(r.contact_id) ? { ...r, review_status: "approved" } : r
+            )
+          : prev
+      );
+      await loadAll();
+      setError(
+        `Approved ${result.updated} contact(s) for outreach.` +
+          (result.not_found ? ` ${result.not_found} could not be found.` : "")
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Bulk approve failed");
+    } finally {
+      setApproving(false);
     }
   }
 
@@ -401,59 +450,126 @@ export default function OutreachPage() {
           )}
 
           <label>
-            Objective — what are you trying to get out of this outreach?
+            <strong>Step 1 — Objective.</strong> What are you trying to get out of this outreach?
             <input
               placeholder="e.g. board seat, Series A raise, distribution partner…"
               value={objective}
               onChange={(e) => setObjective(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && objective.trim() && !ranking) handlePrioritize();
+              }}
             />
             <small className="meta">
-              Used to judge who matters and why. Left blank, drafts fall back to general relationship
-              context.
+              The whole contact base is searched for people who matter for this — you do not
+              approve anyone beforehand.
             </small>
           </label>
 
+          <div className="scan-controls">
+            <label>
+              Scan depth
+              <select value={scanDepth} onChange={(e) => setScanDepth(Number(e.target.value))}>
+                <option value={100}>100 contacts (fastest)</option>
+                <option value={200}>200 contacts</option>
+                <option value={400}>400 contacts</option>
+                <option value={600}>600 contacts (deepest)</option>
+              </select>
+            </label>
+            <label>
+              Shortlist size
+              <select
+                value={shortlistSize}
+                onChange={(e) => setShortlistSize(Number(e.target.value))}
+              >
+                <option value={10}>Top 10 people</option>
+                <option value={25}>Top 25 people</option>
+                <option value={50}>Top 50 people</option>
+                <option value={100}>Top 100 people</option>
+              </select>
+            </label>
+          </div>
+
           <div className="actions">
-            <button onClick={handlePrioritize} disabled={ranking || !objective.trim()}>
-              {ranking ? "Ranking…" : "Prioritize contacts for this objective"}
+            <button
+              className="primary"
+              onClick={handlePrioritize}
+              disabled={ranking || !objective.trim()}
+            >
+              {ranking ? "Finding people…" : "Find people for this objective"}
             </button>
             {ranked && (
-              <button className="link-btn" onClick={() => setRanked(null)}>
-                Clear ranking
+              <button
+                className="link-btn"
+                onClick={() => {
+                  setRanked(null);
+                  setScanSummary(null);
+                }}
+              >
+                Clear results
               </button>
             )}
           </div>
 
           {ranked && (
-            <div className="ranked-list">
-              <strong className="picker-label">
-                Ranked for “{objective}” — best first
-              </strong>
-              {ranked.map((r, i) => (
-                <label
-                  key={r.contact_id}
-                  className={`ranked-item${selected.has(r.contact_id) ? " selected" : ""}`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={selected.has(r.contact_id)}
-                    onChange={() => toggleContact(r.contact_id)}
-                  />
-                  <span className="rank">{i + 1}</span>
-                  <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
-                    {r.objective_score === null ? "—" : r.objective_score}
-                  </span>
-                  <span className="who">
-                    <strong>{r.full_name || r.primary_email}</strong>
-                    {r.company_name ? ` · ${r.company_name}` : ""}
-                    {r.review_status !== "approved" && (
-                      <em className="not-approved"> (approve before drafting)</em>
-                    )}
-                    <span className="why">{r.reason || "No score returned for this contact."}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
+            <>
+              <div className="panel-header" style={{ marginTop: 14 }}>
+                <strong className="picker-label">
+                  Step 2 — Approve in bulk · {ranked.length} match
+                  {ranked.length === 1 ? "" : "es"} for “{objective}”
+                </strong>
+                <div className="actions">
+                  <button
+                    className="link-btn"
+                    onClick={() => setSelected(new Set(ranked.map((r) => r.contact_id)))}
+                  >
+                    Select all
+                  </button>
+                  <button className="link-btn" onClick={() => setSelected(new Set())}>
+                    Select none
+                  </button>
+                </div>
+              </div>
+              {scanSummary && <small className="meta">{scanSummary}</small>}
+
+              <div className="actions" style={{ marginTop: 8 }}>
+                <button className="primary" onClick={handleBulkApprove} disabled={approving}>
+                  {approving
+                    ? "Approving…"
+                    : `Approve ${
+                        ranked.filter((r) => selected.has(r.contact_id)).length
+                      } selected for outreach`}
+                </button>
+              </div>
+
+              <div className="ranked-list">
+                {ranked.map((r, i) => (
+                  <label
+                    key={r.contact_id}
+                    className={`ranked-item${selected.has(r.contact_id) ? " selected" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected.has(r.contact_id)}
+                      onChange={() => toggleContact(r.contact_id)}
+                    />
+                    <span className="rank">{i + 1}</span>
+                    <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
+                      {r.objective_score === null ? "—" : r.objective_score}
+                    </span>
+                    <span className="who">
+                      <strong>{r.full_name || r.primary_email}</strong>
+                      {r.company_name ? ` · ${r.company_name}` : ""}
+                      {r.review_status === "approved" && (
+                        <em className="approved-tag"> approved</em>
+                      )}
+                      <span className="why">
+                        {r.reason || "No score returned for this contact."}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </>
           )}
 
           <label>
@@ -471,12 +587,16 @@ export default function OutreachPage() {
               {generating
                 ? "Generating…"
                 : selected.size > 1
-                  ? `Generate ${selected.size} drafts`
+                  ? `Step 3 — Draft ${selected.size} personalised emails`
                   : selected.size === 1
-                    ? "Generate draft"
-                    : "Generate draft (select contacts)"}
+                    ? "Step 3 — Draft personalised email"
+                    : "Step 3 — Draft (select people above)"}
             </button>
           </div>
+          <small className="meta">
+            Each draft is written from that person&apos;s own history — recent threads, what they
+            last said, and why they matter for this objective.
+          </small>
         </div>
       </div>
 

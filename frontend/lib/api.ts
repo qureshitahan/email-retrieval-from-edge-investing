@@ -222,12 +222,36 @@ export const api = {
   listDrafts: (status?: string) =>
     apiFetch<{ items: EmailDraft[] }>(`/outreach/drafts${status ? `?status=${status}` : ""}`),
   mailboxes: () => apiFetch<{ items: Mailbox[] }>("/outreach/mailboxes"),
-  prioritize: (objective: string, contactIds: string[] = [], limit = 25) =>
-    apiFetch<{ objective: string; scored: number; items: RankedContact[] }>(
-      "/outreach/prioritize",
+  prioritize: (
+    objective: string,
+    contactIds: string[] = [],
+    limit = 200,
+    topN: number | null = 50,
+    mailboxIds: string[] = []
+  ) =>
+    apiFetch<{
+      objective: string;
+      scored: number;
+      scanned: number;
+      batches: number;
+      failed_batches: number;
+      items: RankedContact[];
+    }>("/outreach/prioritize", {
+      method: "POST",
+      body: JSON.stringify({
+        objective,
+        contact_ids: contactIds,
+        limit,
+        top_n: topN,
+        mailbox_ids: mailboxIds,
+      }),
+    }),
+  bulkReview: (contactIds: string[], reviewStatus: "approved" | "denied" | "pending") =>
+    apiFetch<{ review_status: string; requested: number; updated: number; not_found: number }>(
+      "/contacts/bulk-review",
       {
         method: "POST",
-        body: JSON.stringify({ objective, contact_ids: contactIds, limit }),
+        body: JSON.stringify({ contact_ids: contactIds, review_status: reviewStatus }),
       }
     ),
   /** Mailboxes with live readiness — drives the mailbox dropdown on both pages. */

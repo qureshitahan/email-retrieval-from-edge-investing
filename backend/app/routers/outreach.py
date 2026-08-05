@@ -58,7 +58,15 @@ class SendIn(BaseModel):
 class PrioritizeRequest(BaseModel):
     objective: str
     contact_ids: list[str] = []
-    limit: int = 25
+    # How deep to scan the contact base. Batched concurrently behind the scenes.
+    limit: int = 200
+    # Keep only the best N by rank. Preferred over min_score: scores are comparable within a
+    # call but not across scan depths, so a fixed threshold can return an empty list.
+    top_n: int | None = 50
+    # Optional absolute floor on top of the rank cut.
+    min_score: int | None = None
+    # "Where should I look" - restrict candidates to people these mailboxes have emailed.
+    mailbox_ids: list[str] = []
 
 
 @router.get("/mailboxes")
@@ -72,14 +80,17 @@ def get_mailboxes():
 
 
 @router.post("/prioritize")
-def post_prioritize(payload: PrioritizeRequest, db: Session = Depends(get_db)):
+async def post_prioritize(payload: PrioritizeRequest, db: Session = Depends(get_db)):
     """Rank contacts against an objective (e.g. "board seat"), best-first."""
     try:
-        return prioritize_contacts(
+        return await prioritize_contacts(
             db,
             objective=payload.objective,
             contact_ids=payload.contact_ids or None,
             limit=payload.limit,
+            min_score=payload.min_score,
+            top_n=payload.top_n,
+            mailbox_ids=payload.mailbox_ids or None,
         )
     except AIServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
