@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
+from app.models.contact import ContactEmailLink
 from app.models.message import EmailMessage
 from app.models.sync import SyncRun
 from app.schemas import SyncRunOut
 from app.services.mail_readers import MailReadError
-from app.services.mailboxes import Mailbox, MailboxConfigError, default_mailbox, get_mailbox
+from app.services.mailboxes import (
+    Mailbox,
+    MailboxConfigError,
+    default_mailbox,
+    get_mailbox,
+    load_mailboxes,
+)
 from app.services.sync_service import (
     SyncAlreadyRunning,
     SyncService,
@@ -110,6 +120,96 @@ def latest_sync_status(
     if mailbox_id:
         query = query.filter(SyncRun.mailbox_id == mailbox_id)
     return query.order_by(SyncRun.started_at.desc()).first()
+
+
+# Remote folder totals come from Graph, so they are cached: this endpoint is polled every
+# few seconds while a sync runs, and the total barely moves.
+_REMOTE_TOTAL_TTL_SECONDS = 120
+_remote_total_cache: dict[str, tuple[float, int | None]] = {}
+
+
+def _cached_remote_total(db: Session, mailbox) -> int | None:
+    from app.routers.contacts import _remote_sent_total
+
+    cached = _remote_total_cache.get(mailbox.id)
+    now = time.monotonic()
+    if cached and (now - cached[0]) < _REMOTE_TOTAL_TTL_SECONDS:
+        return cached[1]
+    try:
+        total = _remote_sent_total(db, mailbox.id)
+    except Exception:
+        total = cached[1] if cached else None
+    _remote_total_cache[mailbox.id] = (now, total)
+    return total
+
+
+@router.get("/progress")
+def sync_progress(db: Session = Depends(get_db)):
+    """Per-mailbox sync state for the progress bars.
+
+    Reports what is already stored rather than only what the current run has fetched, so a
+    mailbox shows its real position even when no sync is active.
+    """
+    try:
+        mailboxes = load_mailboxes()
+    except MailboxConfigError as exc:
+        return {"items": [], "config_error": str(exc)}
+
+    stored = dict(
+        db.query(EmailMessage.mailbox_id, func.count(EmailMessage.id))
+        .group_by(EmailMessage.mailbox_id)
+        .all()
+    )
+    contacts = dict(
+        db.query(EmailMessage.mailbox_id, func.count(func.distinct(ContactEmailLink.contact_id)))
+        .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
+        .group_by(EmailMessage.mailbox_id)
+        .all()
+    )
+
+    items = []
+    for mailbox in mailboxes:
+        run = (
+            db.query(SyncRun)
+            .filter(SyncRun.mailbox_id == mailbox.id)
+            .order_by(SyncRun.started_at.desc())
+            .first()
+        )
+        synced = stored.get(mailbox.id, 0)
+        remote_total = _cached_remote_total(db, mailbox)
+        running = run is not None and run.status == "running"
+
+        # Percent is against the sent-items total when the provider gives us one. Gmail does
+        # not, so those mailboxes report progress without a percentage rather than a fake one.
+        percent = None
+        if remote_total:
+            percent = min(100, round((synced / remote_total) * 100))
+
+        items.append(
+            {
+                "mailbox_id": mailbox.id,
+                "from_email": mailbox.from_email,
+                "label": mailbox.label,
+                "state": run.status if run else "idle",
+                "is_running": running,
+                "synced_messages": synced,
+                "remote_total": remote_total,
+                "percent": percent,
+                "contacts": contacts.get(mailbox.id, 0),
+                "sync_type": run.sync_type if run else None,
+                "fetched_this_run": run.messages_fetched if run else 0,
+                "new_this_run": run.messages_new if run else 0,
+                "started_at": run.started_at if run else None,
+                "completed_at": run.completed_at if run else None,
+                "error_message": run.error_message if run else None,
+            }
+        )
+
+    return {
+        "items": items,
+        "config_error": None,
+        "any_running": any(i["is_running"] for i in items),
+    }
 
 
 class BackfillRequest(BaseModel):

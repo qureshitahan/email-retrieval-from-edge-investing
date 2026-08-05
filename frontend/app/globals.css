@@ -877,6 +877,105 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- per-mailbox sync progress --- */
+.sync-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 12px 0 16px;
+  background: white;
+  border: 1px solid #e4e8ee;
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
+.sync-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.sync-row.active .sync-row-head strong {
+  color: #4338ca;
+}
+
+.sync-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 0.84rem;
+}
+
+.sync-state {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  color: #5b6475;
+  white-space: nowrap;
+}
+
+.sync-state.running {
+  color: #4338ca;
+}
+
+.sync-state.completed {
+  color: #166534;
+}
+
+.sync-state.failed {
+  color: #b42318;
+}
+
+.sync-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: #eef0f4;
+  overflow: hidden;
+}
+
+.sync-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #6366f1, #4338ca);
+  transition: width 0.5s ease;
+}
+
+.sync-bar-fill.failed {
+  background: #dc2626;
+}
+
+/* No folder total available (Gmail): sweep instead of showing an invented percentage. */
+.sync-bar-fill.indeterminate {
+  background: linear-gradient(90deg, #eef0f4 20%, #6366f1 50%, #eef0f4 80%);
+  background-size: 220% 100%;
+  animation: sync-sweep 1.4s linear infinite;
+}
+
+@keyframes sync-sweep {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
+.sync-row-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.76rem;
+  color: #5b6475;
+  flex-wrap: wrap;
+}
+
+.sync-row-error {
+  font-size: 0.76rem;
+  color: #b42318;
+}
+
 /* --- Compass: objective-first entry point --- */
 .compass-sub {
   font-size: 0.9rem;

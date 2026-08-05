@@ -116,7 +116,14 @@ def reap_interrupted_runs(db: Session, *, older_than: datetime | None = None) ->
 
 
 class SyncService:
-    BATCH_AGGREGATE_SIZE = 250
+    # Aggregates are rebuilt in one write transaction, so this is how long the write lock is
+    # held in the worst case. Smaller batches mean the lock is released more often, which is
+    # what lets the contact list stay readable while a sync runs against a network-mounted
+    # SQLite file.
+    BATCH_AGGREGATE_SIZE = 100
+    # Yield between pages so queued readers get the lock. Costs a little throughput and buys
+    # a UI that keeps responding - the sync is background work, the page is not.
+    PAGE_PAUSE_SECONDS = 0.25
 
     def __init__(self, db: Session, mailbox: Mailbox | None = None):
         self.db = db
@@ -187,11 +194,17 @@ class SyncService:
                 sync_run.messages_fetched = messages_fetched
                 sync_run.messages_new = messages_new
                 sync_run.checkpoint_url = next_cursor
+                # Progress is committed every page, so the UI can report real numbers and the
+                # contacts imported so far are already queryable - a sync that is still running
+                # has nonetheless delivered everything it has read.
                 self.db.commit()
 
                 cursor = next_cursor
                 if not cursor:
                     break
+
+                # Hand the write lock back before starting the next page.
+                await asyncio.sleep(self.PAGE_PAUSE_SECONDS)
 
             updated_count = (
                 rebuild_contact_aggregates(self.db, list(touched_contact_ids))

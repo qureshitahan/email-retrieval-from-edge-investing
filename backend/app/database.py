@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Generator
 from pathlib import Path
 
@@ -7,6 +8,10 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import BASE_DIR, get_settings
+
+# Set by App Service. On Azure the persistent path (/home) is an Azure Files SMB share, which
+# changes what SQLite settings are safe - see the journal-mode note below.
+ON_AZURE_APP_SERVICE = bool(os.getenv("WEBSITE_SITE_NAME"))
 
 settings = get_settings()
 data_dir = BASE_DIR / "data"
@@ -18,7 +23,17 @@ if settings.database_url.startswith("sqlite"):
     if db_path and db_path not in (":memory:",):
         Path(db_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+IS_SQLITE = settings.database_url.startswith("sqlite")
+
+# How long a statement waits for another connection's lock before giving up. SQLite's default
+# via python-sqlite3 is 5 seconds, which a sync writing to Azure Files (an SMB share, where
+# every write is a network round trip) blows straight through - readers then die with
+# "database is locked" instead of simply waiting their turn.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
+connect_args = (
+    {"check_same_thread": False, "timeout": SQLITE_BUSY_TIMEOUT_SECONDS} if IS_SQLITE else {}
+)
 engine = create_engine(settings.database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -27,13 +42,44 @@ class Base(DeclarativeBase):
     pass
 
 
-if settings.database_url.startswith("sqlite"):
+# Set once, on the first connection, and reported so the startup log says which mode won.
+journal_mode_in_use: str | None = None
+
+
+if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+        global journal_mode_in_use
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            # The timeout above covers python-sqlite3; this covers statements SQLite runs
+            # internally on the same connection.
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
+
+            # WAL lets readers work while a writer is mid-transaction, which is exactly the
+            # contention a long sync creates - but it relies on shared memory and SQLite
+            # documents that it does NOT work over a network filesystem. On Azure App Service
+            # the database lives on /home, an Azure Files SMB share, so asking for WAL there
+            # risks disk I/O errors against real data. Detect that environment and leave the
+            # journal alone; the busy timeout above is what keeps reads alive on Azure.
+            if ON_AZURE_APP_SERVICE:
+                journal_mode_in_use = "delete (WAL skipped: /home is a network share)"
+            else:
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    row = cursor.fetchone()
+                    journal_mode_in_use = (row[0] if row else "unknown").lower()
+                except Exception:
+                    journal_mode_in_use = "delete (WAL refused)"
+
+            # FULL forces an fsync per commit; over SMB that dominates the write time. NORMAL
+            # is durable against process crashes, and only risks the last commit on a host
+            # power failure - an acceptable trade for mail that can simply be re-synced.
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
 
 
 def _assign_contact_list_numbers(conn) -> None:

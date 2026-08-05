@@ -143,12 +143,20 @@ def _update_reply_status(contact: Contact, messages: list[EmailMessage]) -> None
         contact.days_since_outreach = None
 
 
+# Contacts rebuilt per write transaction. One commit for the whole batch held SQLite's
+# exclusive lock for as long as the batch took, which on a network-mounted database (Azure
+# Files) is seconds - long enough for every concurrent read to time out with "database is
+# locked". Committing in small chunks keeps each lock window short.
+AGGREGATE_COMMIT_CHUNK = 25
+
+
 def rebuild_contact_aggregates(db: Session, contact_ids: list[str] | None = None) -> int:
     query = db.query(Contact)
     if contact_ids:
         query = query.filter(Contact.id.in_(contact_ids))
     contacts = query.all()
     updated = 0
+    since_commit = 0
 
     for contact in contacts:
         messages = (
@@ -276,6 +284,12 @@ def rebuild_contact_aggregates(db: Session, contact_ids: list[str] | None = None
         context.meaningful_previews = meaningful
         context.updated_at = datetime.utcnow()
         updated += 1
+        since_commit += 1
+
+        # Release the write lock regularly so readers are not starved for the whole batch.
+        if since_commit >= AGGREGATE_COMMIT_CHUNK:
+            db.commit()
+            since_commit = 0
 
     db.commit()
     return updated

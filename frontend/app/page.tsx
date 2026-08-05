@@ -9,6 +9,7 @@ import {
   formatDate,
   MailboxStatus,
   Stats,
+  SyncProgress,
   SyncRun,
   tierClass,
   reviewClass,
@@ -16,6 +17,7 @@ import {
 import { InfoTip, SectionHeading } from "@/components/InfoTip";
 import { MailboxPicker } from "@/components/MailboxPicker";
 import { Nav } from "@/components/Nav";
+import { SyncProgressBars } from "@/components/SyncProgressBars";
 import { RelevanceTierHelp, ScoreBreakdownHelp } from "@/lib/helpText";
 
 export default function HomePage() {
@@ -36,6 +38,7 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
+  const [progress, setProgress] = useState<SyncProgress[]>([]);
   const [aiLoading, setAiLoading] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
@@ -93,6 +96,41 @@ export default function HomePage() {
     loadAll();
   }, [loadAll]);
 
+  // Progress polls continuously — not only while this tab started a sync — so a run kicked
+  // off elsewhere (or still going after a reload) still shows its bars.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    async function poll() {
+      try {
+        const data = await api.syncProgress();
+        if (cancelled) return;
+        setProgress(data.items);
+        // Refresh the contact list while a sync runs so rows appear as they are imported,
+        // rather than only once the whole mailbox has finished.
+        if (data.any_running) {
+          setSyncing(true);
+          loadAll();
+        } else if (syncing) {
+          setSyncing(false);
+          loadAll();
+        }
+        timer = setTimeout(poll, data.any_running ? 4000 : 20000);
+      } catch {
+        // A failed poll must not kill the loop; back off and try again.
+        if (!cancelled) timer = setTimeout(poll, 15000);
+      }
+    }
+
+    poll();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     if (!sync || sync.status !== "running") return;
     // Poll the run we actually started, not whichever run happens to be newest.
@@ -104,7 +142,7 @@ export default function HomePage() {
         setSyncing(false);
         loadAll();
       }
-    }, 3000);
+    }, 4000);
     return () => clearInterval(timer);
   }, [sync, loadAll]);
 
@@ -281,6 +319,8 @@ export default function HomePage() {
       </div>
 
       {error && <div className="banner error">{error}</div>}
+
+      <SyncProgressBars items={progress} activeMailboxId={activeMailbox} />
 
       {stats && stats.unattributed_messages > 0 && selectedMailbox && (
         <div className="banner info">
