@@ -105,6 +105,26 @@ export type Mailbox = {
   auth_hint: string;
 };
 
+/** Live sync state for one mailbox, used for the progress bars. */
+export type SyncProgress = {
+  mailbox_id: string;
+  from_email: string;
+  label: string;
+  state: "idle" | "running" | "completed" | "failed";
+  is_running: boolean;
+  synced_messages: number;
+  /** null when the provider gives no folder total (Gmail) — show progress without a %. */
+  remote_total: number | null;
+  percent: number | null;
+  contacts: number;
+  sync_type: string | null;
+  fetched_this_run: number;
+  new_this_run: number;
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+};
+
 /** A contact scored against an objective. `objective_score` is null when unscored. */
 export type RankedContact = {
   contact_id: string;
@@ -200,6 +220,7 @@ export const api = {
       `/sync/start-inbox${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`,
       { method: "POST" }
     ),
+  syncProgress: () => apiFetch<{ items: SyncProgress[]; any_running: boolean }>("/sync/progress"),
   syncStatus: (mailboxId?: string) =>
     apiFetch<SyncRun | null>(
       `/sync/status${mailboxId ? `?mailbox_id=${encodeURIComponent(mailboxId)}` : ""}`
