@@ -192,7 +192,9 @@ async def build_full_context(db: Session, contact_id: str) -> str:
     return base
 
 
-def _call_anthropic(system: str, user_prompt: str) -> str:
+def _call_anthropic(system: str, user_prompt: str, *, max_tokens: int = 1500) -> str:
+    """One completion. ``max_tokens`` is raisable for callers whose reply is a long list:
+    a truncated response is not an error, it is silently unparseable output."""
     settings = get_settings()
     client = _get_client()
     fallbacks = [
@@ -210,7 +212,7 @@ def _call_anthropic(system: str, user_prompt: str) -> str:
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=1500,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user_prompt}],
             )

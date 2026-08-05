@@ -4,6 +4,7 @@ from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
@@ -306,6 +307,44 @@ def get_contact(contact_id: str, db: Session = Depends(get_db)):
         ai_contact_classification=context.ai_contact_classification if context else None,
         ai_summary_generated_at=context.ai_summary_generated_at if context else None,
     )
+
+
+class BulkReviewRequest(BaseModel):
+    contact_ids: list[str]
+    review_status: str
+
+
+@router.post("/bulk-review")
+def bulk_review(payload: BulkReviewRequest, db: Session = Depends(get_db)):
+    """Set review status on many contacts at once.
+
+    Approving one contact at a time does not scale past a few dozen people, and the objective
+    flow produces a whole ranked shortlist to accept in one go. Declared above the
+    ``/{contact_id}`` routes so "bulk-review" is not captured as a contact id.
+    """
+    if payload.review_status not in REVIEW_STATUSES:
+        raise HTTPException(
+            status_code=400, detail="review_status must be pending, approved, or denied"
+        )
+    if not payload.contact_ids:
+        raise HTTPException(status_code=400, detail="No contacts selected")
+
+    updated = (
+        db.query(Contact)
+        .filter(Contact.id.in_(payload.contact_ids))
+        .update(
+            {Contact.review_status: payload.review_status, Contact.updated_at: datetime.utcnow()},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {
+        "review_status": payload.review_status,
+        "requested": len(payload.contact_ids),
+        "updated": updated,
+        # A shortfall means some ids no longer exist; surfaced rather than swallowed.
+        "not_found": len(payload.contact_ids) - updated,
+    }
 
 
 @router.patch("/{contact_id}", response_model=ContactDetail)

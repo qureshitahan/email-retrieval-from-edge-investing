@@ -19,6 +19,7 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -30,8 +31,17 @@ from app.models.message import EmailMessage
 from app.services.ai_service import AIServiceError, _call_anthropic
 from app.services.text_utils import is_trivial_preview, strip_quoted_reply
 
-# Upper bound on how many candidates go to the model in one call.
-MAX_CANDIDATES = 40
+# How many candidates one LLM call judges. Kept modest for two reasons: the model attends to
+# every candidate rather than skimming, and the JSON reply stays well inside SCORING_MAX_TOKENS.
+# At 40 per batch the reply overran the token limit, was truncated mid-array, and every score
+# silently came back null.
+BATCH_SIZE = 20
+# Room for BATCH_SIZE entries each carrying a sentence of justification, with headroom.
+SCORING_MAX_TOKENS = 4000
+# How deep into the contact base a single request scans. Batches run concurrently, so this
+# is bounded by patience rather than by one prompt's size.
+DEFAULT_SCAN = 200
+MAX_SCAN = 600
 SUBJECT_SAMPLES = 4
 BRIEF_EXCERPT_CHARS = 200
 
@@ -138,19 +148,41 @@ def build_candidate_brief(db: Session, contact: Contact) -> str:
     return "\n".join(parts)
 
 
-def shortlist_candidates(db: Session, contact_ids: list[str] | None, limit: int) -> list[Contact]:
-    """Contacts to judge: an explicit set, or the strongest existing candidates."""
+def shortlist_candidates(
+    db: Session,
+    contact_ids: list[str] | None,
+    limit: int,
+    mailbox_ids: list[str] | None = None,
+) -> list[Contact]:
+    """Contacts to judge: an explicit set, or the strongest existing candidates.
+
+    ``mailbox_ids`` answers "where should I look" - only people the chosen mailboxes have
+    actually corresponded with are considered.
+    """
     query = db.query(Contact).options(joinedload(Contact.context))
     if contact_ids:
         return query.filter(Contact.id.in_(contact_ids)).all()
 
-    return (
-        query.filter(
-            Contact.is_internal.is_(False),
-            Contact.is_excluded.is_(False),
-            Contact.email_count > 0,
+    query = query.filter(
+        Contact.is_internal.is_(False),
+        Contact.is_excluded.is_(False),
+        Contact.email_count > 0,
+    )
+
+    if mailbox_ids:
+        from_selected = (
+            db.query(ContactEmailLink.id)
+            .join(EmailMessage, EmailMessage.id == ContactEmailLink.email_message_id)
+            .filter(
+                ContactEmailLink.contact_id == Contact.id,
+                EmailMessage.mailbox_id.in_(mailbox_ids),
+            )
+            .exists()
         )
-        .order_by(
+        query = query.filter(from_selected)
+
+    return (
+        query.order_by(
             Contact.fundraising_relevance_score.desc(),
             Contact.email_count.desc(),
         )
@@ -173,7 +205,14 @@ def _parse_rankings(raw: str, count: int) -> dict[int, dict]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return {}
+        # A reply cut off by the token limit is valid up to the truncation point. Recover the
+        # complete objects rather than throwing away every score in the batch.
+        parsed = []
+        for match in re.finditer(r"\{[^{}]*\}", text, re.S):
+            try:
+                parsed.append(json.loads(match.group(0)))
+            except json.JSONDecodeError:
+                continue
     if not isinstance(parsed, list):
         return {}
 
@@ -193,58 +232,111 @@ def _parse_rankings(raw: str, count: int) -> dict[int, dict]:
     return out
 
 
-def prioritize_contacts(
+def _score_batch(objective: str, briefs: list[str]) -> dict[int, dict]:
+    """One LLM call over one batch. Pure strings in, so it is safe off the main thread."""
+    raw = _call_anthropic(
+        SYSTEM_PROMPT,
+        USER_TEMPLATE.format(objective=objective, count=len(briefs), candidates="\n\n".join(briefs)),
+        max_tokens=SCORING_MAX_TOKENS,
+    )
+    return _parse_rankings(raw, len(briefs))
+
+
+async def prioritize_contacts(
     db: Session,
     *,
     objective: str,
     contact_ids: list[str] | None = None,
-    limit: int = MAX_CANDIDATES,
+    limit: int = DEFAULT_SCAN,
+    min_score: int | None = None,
+    top_n: int | None = None,
+    mailbox_ids: list[str] | None = None,
 ) -> dict:
-    """Rank contacts for an objective. Returns candidates ordered best-first."""
+    """Rank contacts for an objective, best-first.
+
+    Scans in concurrent batches so the shortlist can span hundreds of people rather than one
+    prompt's worth. Contacts are judged regardless of review status - the point is to find who
+    matters for the objective first, and approve them afterwards.
+    """
     objective = (objective or "").strip()
     if not objective:
         raise AIServiceError("An objective is required to prioritise contacts")
 
-    limit = max(1, min(limit, MAX_CANDIDATES))
-    candidates = shortlist_candidates(db, contact_ids, limit)
+    limit = max(1, min(limit, MAX_SCAN))
+    candidates = shortlist_candidates(db, contact_ids, limit, mailbox_ids)
     if not candidates:
-        return {"objective": objective, "items": [], "scored": 0}
+        return {
+            "objective": objective,
+            "items": [],
+            "scored": 0,
+            "scanned": 0,
+            "batches": 0,
+            "failed_batches": 0,
+        }
 
-    briefs = [
-        f"[{i}] {build_candidate_brief(db, contact)}"
-        for i, contact in enumerate(candidates, start=1)
-    ]
-    raw = _call_anthropic(
-        SYSTEM_PROMPT,
-        USER_TEMPLATE.format(
-            objective=objective, count=len(candidates), candidates="\n\n".join(briefs)
-        ),
+    # Briefs are built here, on the thread that owns the session: the DB session is not
+    # thread-safe, so only the model calls are allowed to fan out.
+    briefs = [build_candidate_brief(db, contact) for contact in candidates]
+
+    batches: list[tuple[list[Contact], list[str]]] = []
+    for start in range(0, len(candidates), BATCH_SIZE):
+        chunk = candidates[start : start + BATCH_SIZE]
+        chunk_briefs = [
+            f"[{i}] {briefs[start + offset]}" for i, offset in enumerate(range(len(chunk)), start=1)
+        ]
+        batches.append((chunk, chunk_briefs))
+
+    scored_batches = await asyncio.gather(
+        *(asyncio.to_thread(_score_batch, objective, chunk_briefs) for _, chunk_briefs in batches),
+        return_exceptions=True,
     )
-    rankings = _parse_rankings(raw, len(candidates))
 
-    items = []
-    for i, contact in enumerate(candidates, start=1):
-        ranked = rankings.get(i)
-        items.append(
-            {
-                "contact_id": contact.id,
-                "list_number": contact.list_number,
-                "full_name": contact.full_name,
-                "primary_email": contact.primary_email,
-                "company_name": contact.company_name,
-                "review_status": contact.review_status,
-                "baseline_score": contact.fundraising_relevance_score,
-                # None (not 0) when the model skipped it, so the UI can say "unscored"
-                # instead of implying the contact was judged irrelevant.
-                "objective_score": ranked["score"] if ranked else None,
-                "reason": ranked["reason"] if ranked else None,
-            }
-        )
+    items: list[dict] = []
+    failed_batches = 0
+    for (chunk, _), rankings in zip(batches, scored_batches):
+        # A failed batch leaves its candidates unscored rather than losing them entirely.
+        if isinstance(rankings, BaseException):
+            failed_batches += 1
+            rankings = {}
+        for i, contact in enumerate(chunk, start=1):
+            ranked = rankings.get(i)
+            items.append(
+                {
+                    "contact_id": contact.id,
+                    "list_number": contact.list_number,
+                    "full_name": contact.full_name,
+                    "primary_email": contact.primary_email,
+                    "company_name": contact.company_name,
+                    "review_status": contact.review_status,
+                    "baseline_score": contact.fundraising_relevance_score,
+                    # None (not 0) when the model skipped it, so the UI can say "unscored"
+                    # instead of implying the contact was judged irrelevant.
+                    "objective_score": ranked["score"] if ranked else None,
+                    "reason": ranked["reason"] if ranked else None,
+                }
+            )
 
     # Unscored candidates sort last rather than as zeros.
     items.sort(key=lambda item: (item["objective_score"] is None, -(item["objective_score"] or 0)))
+
+    scanned = len(items)
+
+    # Trim by rank first. Scores are only comparable within one call - the model marks more
+    # harshly when a batch holds 40 candidates than 20 - so an absolute cut-off silently
+    # returns nothing at larger scan depths. Rank stays meaningful either way, which is why
+    # top_n is the primary control and min_score is opt-in.
+    if top_n is not None and top_n > 0:
+        items = items[:top_n]
+    if min_score is not None and min_score > 0:
+        items = [
+            i for i in items if i["objective_score"] is not None and i["objective_score"] >= min_score
+        ]
+
     return {
         "objective": objective,
         "items": items,
-        "scored": sum(1 for item in items if item["objective_score"] is not None),
+        "scored": sum(1 for i in items if i["objective_score"] is not None),
+        "scanned": scanned,
+        "batches": len(batches),
+        "failed_batches": failed_batches,
     }

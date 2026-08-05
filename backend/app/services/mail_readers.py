@@ -147,17 +147,21 @@ class AppGraphReader:
                 return payload.get("value", []), payload.get("@odata.nextLink")
         raise MailReadError(f"{self.mailbox.from_email}: Graph rate limit exceeded after retries")
 
+    # Newest first, deliberately. Ascending order means a 14,000-message mailbox spends its
+    # first several minutes importing the oldest mail in the account, so the contacts you
+    # actually care about appear last. Descending puts this month's correspondence on screen
+    # within seconds, and a sync that is interrupted has still delivered the useful part.
     async def fetch_sent_page(self, cursor: str | None) -> tuple[list[dict], str | None]:
         url = cursor or (
             f"{GRAPH_BASE}/users/{self.mailbox.from_email}/mailFolders/sentitems/messages"
-            f"?$select={MESSAGE_SELECT}&$orderby=sentDateTime asc&$top=100"
+            f"?$select={MESSAGE_SELECT}&$orderby=sentDateTime desc&$top=100"
         )
         return await self._page(url)
 
     async def fetch_inbox_page(self, cursor: str | None) -> tuple[list[dict], str | None]:
         url = cursor or (
             f"{GRAPH_BASE}/users/{self.mailbox.from_email}/mailFolders/inbox/messages"
-            f"?$select={INBOX_MESSAGE_SELECT}&$orderby=receivedDateTime asc&$top=100"
+            f"?$select={INBOX_MESSAGE_SELECT}&$orderby=receivedDateTime desc&$top=100"
         )
         return await self._page(url)
 
@@ -331,10 +335,13 @@ class GmailImapReader:
             if total == 0 or offset >= total:
                 return [], None
 
-            # Oldest-first so a resumed sync keeps making forward progress, matching the
-            # ascending order the Graph readers request.
-            start = offset + 1
-            end = min(offset + IMAP_PAGE_SIZE, total)
+            # Newest first, matching the Graph readers. IMAP sequence numbers run 1..total
+            # with the newest last, so walk down from the top: offset counts how many of the
+            # newest messages have already been consumed.
+            end = total - offset
+            start = max(1, end - IMAP_PAGE_SIZE + 1)
+            if end < 1:
+                return [], None
             status, data = imap.fetch(f"{start}:{end}", "(RFC822)")
             if status != "OK":
                 raise MailReadError(f"{self.mailbox.from_email}: IMAP fetch failed ({status})")
@@ -347,8 +354,11 @@ class GmailImapReader:
                 shaped = _to_graph_shape(self.mailbox, entry[1], inbound=not sent)
                 if shaped:
                     items.append(shaped)
+            # Server returns the range ascending; flip so the caller sees newest first too.
+            items.reverse()
 
-            next_cursor = str(end) if end < total else None
+            consumed = offset + (end - start + 1)
+            next_cursor = str(consumed) if consumed < total else None
             return items, next_cursor
         finally:
             try:
