@@ -23,6 +23,9 @@ jobs:
   verify:
     name: Verify build
     runs-on: ubuntu-latest
+    # The work here is ~2 minutes. Without a bound a wedged step would hold the concurrency
+    # group for GitHub's 6 hour default, blocking every later merge behind it.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +67,8 @@ jobs:
     name: Deploy API
     needs: verify
     runs-on: ubuntu-latest
+    # Upload is quick; Azure then runs pip install via Oryx before the app answers.
+    timeout-minutes: 25
     environment:
       name: production-api
       url: ${{ steps.deploy.outputs.webapp-url }}
@@ -118,6 +123,9 @@ jobs:
     name: Deploy Web
     needs: verify
     runs-on: ubuntu-latest
+    # The long pole in the whole pipeline: Oryx runs npm install and next build on the B1
+    # instance itself, which takes far longer than the same build on a runner.
+    timeout-minutes: 40
     environment:
       name: production-web
       url: ${{ steps.deploy.outputs.webapp-url }}
