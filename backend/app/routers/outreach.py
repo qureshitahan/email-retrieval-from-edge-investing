@@ -17,6 +17,7 @@ from app.services.outreach_service import (
     list_drafts,
     send_approved_drafts,
     send_draft,
+    send_drafts,
     set_draft_mailbox,
     update_draft,
     update_prompt_config,
@@ -34,6 +35,9 @@ class GenerateDraftsRequest(BaseModel):
     contact_ids: list[str] = []
     custom_instructions: str | None = None
     objective: str | None = None
+    # Mailboxes the objective was searched across. Each draft is pinned to whichever of them
+    # already corresponds with that contact, so a later "send all" needs no further input.
+    mailbox_ids: list[str] = []
 
 
 class SingleGenerateRequest(BaseModel):
@@ -127,6 +131,7 @@ async def post_generate_drafts(payload: GenerateDraftsRequest, db: Session = Dep
                 payload.contact_ids[0],
                 custom_instructions=payload.custom_instructions,
                 objective=payload.objective,
+                mailbox_ids=payload.mailbox_ids or None,
             )
             return {"items": [draft_to_dict(draft)]}
         except OutreachError as exc:
@@ -136,6 +141,7 @@ async def post_generate_drafts(payload: GenerateDraftsRequest, db: Session = Dep
         payload.contact_ids,
         custom_instructions=payload.custom_instructions,
         objective=payload.objective,
+        mailbox_ids=payload.mailbox_ids or None,
     )
     draft_ids = [r["draft_id"] for r in results if r.get("draft_id")]
     drafts = list_drafts(db)
@@ -199,6 +205,33 @@ async def post_send_draft(
         return draft_to_dict(draft)
     except OutreachError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class SendBatchIn(BaseModel):
+    draft_ids: list[str]
+    # Omit to let each draft use the mailbox it was pinned to at generation time.
+    mailbox_id: str | None = None
+
+
+@router.post("/drafts/send-batch")
+async def post_send_batch(payload: SendBatchIn, db: Session = Depends(get_db)):
+    """Send the named drafts, each from its own mailbox unless one is forced."""
+    try:
+        results = await send_drafts(db, payload.draft_ids, mailbox_id=payload.mailbox_id)
+    except OutreachError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    sent = [r for r in results if r["status"] == "sent"]
+    by_mailbox: dict[str, int] = {}
+    for r in sent:
+        key = r.get("mailbox_id") or "default"
+        by_mailbox[key] = by_mailbox.get(key, 0) + 1
+    return {
+        "results": results,
+        "sent": len(sent),
+        "failed": len(results) - len(sent),
+        "by_mailbox": by_mailbox,
+    }
 
 
 @router.post("/drafts/send-approved")

@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { DraftCard } from "@/components/DraftCard";
 import { Nav } from "@/components/Nav";
-import { api, MailboxStatus, RankedContact } from "@/lib/api";
+import { api, EmailDraft, MailboxStatus, RankedContact } from "@/lib/api";
 
 /**
  * Objective-first outreach.
@@ -34,10 +35,15 @@ export default function CompassPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [summary, setSummary] = useState<string | null>(null);
 
+  const [drafts, setDrafts] = useState<EmailDraft[]>([]);
+  const [selectedDrafts, setSelectedDrafts] = useState<Set<string>>(new Set());
+
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
   const [approving, setApproving] = useState(false);
   const [drafting, setDrafting] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [busyDraft, setBusyDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -160,18 +166,138 @@ export default function CompassPage() {
       const result = await api.generateDrafts(
         chosen.map((r) => r.contact_id),
         undefined,
-        objective.trim()
+        objective.trim(),
+        // Pass the searched mailboxes so each draft is pinned to the one that already
+        // corresponds with its recipient.
+        Array.from(included)
       );
       const failed = result.results?.filter((r) => r.status === "error") || [];
+      setDrafts(result.items);
+      setSelectedDrafts(new Set(result.items.map((d) => d.id)));
       setNotice(
-        `Drafted ${result.items.length} email(s) for "${objective.trim()}". ` +
-          `Open the Outreach tab to review, choose a sending mailbox, and send.` +
-          (failed.length ? ` ${failed.length} failed.` : "")
+        `Drafted ${result.items.length} email(s) for "${objective.trim()}". Review them below, ` +
+          `then send.` + (failed.length ? ` ${failed.length} could not be drafted.` : "")
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Drafting failed");
     } finally {
       setDrafting(false);
+    }
+  }
+
+  function patchDraft(id: string, patch: Partial<EmailDraft>) {
+    setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
+  }
+
+  async function handleDraftMailbox(id: string, mailboxId: string) {
+    patchDraft(id, { sending_mailbox_id: mailboxId });
+    try {
+      await api.setDraftMailbox(id, mailboxId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not change the sending mailbox");
+    }
+  }
+
+  async function handleSaveDraft(id: string) {
+    const draft = drafts.find((d) => d.id === id);
+    if (!draft) return;
+    try {
+      await api.updateDraft(id, { subject: draft.subject || "", body: draft.body || "" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the draft");
+    }
+  }
+
+  async function handleRegenerate(id: string) {
+    const draft = drafts.find((d) => d.id === id);
+    if (!draft) return;
+    setBusyDraft(id);
+    setError(null);
+    try {
+      const fresh = await api.generateDraftForContact(draft.contact_id, undefined, objective.trim());
+      patchDraft(id, { subject: fresh.subject, body: fresh.body, status: fresh.status });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Regenerate failed");
+    } finally {
+      setBusyDraft(null);
+    }
+  }
+
+  async function handleDiscard(id: string) {
+    setBusyDraft(id);
+    try {
+      await api.discardDraft(id);
+      setDrafts((prev) => prev.filter((d) => d.id !== id));
+      setSelectedDrafts((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not discard the draft");
+    } finally {
+      setBusyDraft(null);
+    }
+  }
+
+  async function handleSendOne(id: string) {
+    setBusyDraft(id);
+    setError(null);
+    try {
+      await handleSaveDraft(id);
+      const sent = await api.sendDraft(id);
+      patchDraft(id, { status: sent.status, sent_at: sent.sent_at });
+      setNotice(`Sent to ${sent.contact_email}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Send failed");
+    } finally {
+      setBusyDraft(null);
+    }
+  }
+
+  async function handleSendAll() {
+    const ids = drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").map((d) => d.id);
+    if (ids.length === 0) {
+      setError("No unsent drafts are selected");
+      return;
+    }
+    const missing = drafts.filter((d) => ids.includes(d.id) && !d.sending_mailbox_id);
+    if (missing.length > 0) {
+      setError(`${missing.length} draft(s) have no sending mailbox. Choose one on each card.`);
+      return;
+    }
+    setSending(true);
+    setError(null);
+    try {
+      // Save any edits first, or the sent copy would not match what is on screen.
+      await Promise.all(ids.map((id) => handleSaveDraft(id)));
+      // No mailbox_id: each draft goes out from the identity it was pinned to.
+      const result = await api.sendDraftBatch(ids);
+      setDrafts((prev) =>
+        prev.map((d) =>
+          result.results.some((r) => r.draft_id === d.id && r.status === "sent")
+            ? { ...d, status: "sent" }
+            : d
+        )
+      );
+      const breakdown = Object.entries(result.by_mailbox)
+        .map(([id, n]) => {
+          const box = mailboxes.find((m) => m.id === id);
+          return `${n} from ${box ? box.from_email : id}`;
+        })
+        .join(", ");
+      setNotice(
+        `Sent ${result.sent} email(s)${breakdown ? ` — ${breakdown}` : ""}.` +
+          (result.failed ? ` ${result.failed} failed.` : "")
+      );
+      if (result.failed) {
+        const firstError = result.results.find((r) => r.status === "error");
+        if (firstError?.error) setError(`First failure: ${firstError.error}`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Send all failed");
+    } finally {
+      setSending(false);
     }
   }
 
@@ -381,6 +507,72 @@ export default function CompassPage() {
                   <span className="why">{r.reason || "No score returned for this contact."}</span>
                 </span>
               </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {drafts.length > 0 && (
+        <div className="outreach-panel" style={{ marginTop: 16 }}>
+          <div className="panel-header">
+            <h2>
+              Review drafts ({drafts.filter((d) => d.status !== "sent").length} to send
+              {drafts.some((d) => d.status === "sent") &&
+                `, ${drafts.filter((d) => d.status === "sent").length} sent`}
+              )
+            </h2>
+            <div className="actions">
+              <button
+                className="link-btn"
+                onClick={() => setSelectedDrafts(new Set(drafts.map((d) => d.id)))}
+              >
+                Select all
+              </button>
+              <button className="link-btn" onClick={() => setSelectedDrafts(new Set())}>
+                Select none
+              </button>
+            </div>
+          </div>
+
+          <p className="meta">
+            Each draft is pre-set to send from the mailbox that already corresponds with that
+            person. Change any of them below, or send them all as they stand.
+          </p>
+
+          <div className="actions send-all-row">
+            <button className="primary" onClick={handleSendAll} disabled={sending}>
+              {sending
+                ? "Sending…"
+                : `Send draft to all (${
+                    drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").length
+                  })`}
+            </button>
+          </div>
+
+          <div className="draft-cards">
+            {drafts.map((draft, i) => (
+              <DraftCard
+                key={draft.id}
+                draft={draft}
+                index={i}
+                total={drafts.length}
+                mailboxes={mailboxes}
+                selected={selectedDrafts.has(draft.id)}
+                busy={busyDraft === draft.id || sending}
+                onToggle={() =>
+                  setSelectedDrafts((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(draft.id)) next.delete(draft.id);
+                    else next.add(draft.id);
+                    return next;
+                  })
+                }
+                onChangeMailbox={(mailboxId) => handleDraftMailbox(draft.id, mailboxId)}
+                onEdit={(patch) => patchDraft(draft.id, patch)}
+                onSend={() => handleSendOne(draft.id)}
+                onRegenerate={() => handleRegenerate(draft.id)}
+                onDelete={() => handleDiscard(draft.id)}
+              />
             ))}
           </div>
         </div>

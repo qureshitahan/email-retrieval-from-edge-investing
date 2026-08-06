@@ -280,7 +280,28 @@ export const api = {
     apiFetch<{ items: MailboxStatus[]; config_error: string | null; sendable?: string[] }>(
       `/mailboxes?refresh=${refresh}`
     ),
-  generateDrafts: (contactIds: string[], customInstructions?: string, objective?: string) =>
+  sendDraftBatch: (draftIds: string[], mailboxId?: string) =>
+    apiFetch<{
+      results: Array<{
+        draft_id: string;
+        status: string;
+        error?: string;
+        mailbox_id?: string;
+        to?: string;
+      }>;
+      sent: number;
+      failed: number;
+      by_mailbox: Record<string, number>;
+    }>("/outreach/drafts/send-batch", {
+      method: "POST",
+      body: JSON.stringify({ draft_ids: draftIds, mailbox_id: mailboxId ?? null }),
+    }),
+  generateDrafts: (
+    contactIds: string[],
+    customInstructions?: string,
+    objective?: string,
+    mailboxIds: string[] = []
+  ) =>
     apiFetch<{ items: EmailDraft[]; results?: Array<{ contact_id: string; status: string; error?: string }> }>(
       "/outreach/drafts/generate",
       {
@@ -289,6 +310,7 @@ export const api = {
           contact_ids: contactIds,
           custom_instructions: customInstructions || null,
           objective: objective || null,
+          mailbox_ids: mailboxIds,
         }),
       }
     ),
@@ -303,6 +325,12 @@ export const api = {
   updateDraft: (id: string, data: { subject?: string; body?: string; status?: string }) =>
     apiFetch<EmailDraft>(`/outreach/drafts/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   approveDraft: (id: string) => apiFetch<EmailDraft>(`/outreach/drafts/${id}/approve`, { method: "POST" }),
+  /** Discard a draft. There is no delete route, so it is marked and filtered out of views. */
+  discardDraft: (id: string) =>
+    apiFetch<EmailDraft>(`/outreach/drafts/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "discarded" }),
+    }),
   setDraftMailbox: (id: string, mailboxId: string) =>
     apiFetch<EmailDraft>(`/outreach/drafts/${id}/sending-mailbox`, {
       method: "POST",
