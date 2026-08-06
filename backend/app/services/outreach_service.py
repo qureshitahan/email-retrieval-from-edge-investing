@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
+from app.models.contact import ContactEmailLink
+from app.models.message import EmailMessage
 from app.models.outreach import EmailDraft, OutreachPrompt
 from app.services.ai_service import _call_anthropic, build_metadata_context, _contact_messages, _get_contact
 from app.services.graph_client import GraphAuthError, GraphClient
@@ -208,6 +211,7 @@ async def generate_draft_for_contact(
     *,
     custom_instructions: str | None = None,
     objective: str | None = None,
+    mailbox_ids: list[str] | None = None,
 ) -> EmailDraft:
     contact = _get_contact(db, contact_id)
     if contact.review_status != "approved":
@@ -242,6 +246,12 @@ async def generate_draft_for_contact(
     draft.user_prompt = user_prompt
     draft.error_message = None
     draft.updated_at = datetime.utcnow()
+
+    # Route the reply back through the mailbox that already holds this relationship, so a
+    # bulk send needs no per-draft decision. An identity chosen by hand is left alone.
+    if not draft.sending_mailbox_id:
+        draft.sending_mailbox_id = resolve_source_mailbox(db, contact_id, mailbox_ids)
+
     if not existing:
         db.add(draft)
     db.commit()
@@ -255,12 +265,17 @@ async def generate_drafts_bulk(
     *,
     custom_instructions: str | None = None,
     objective: str | None = None,
+    mailbox_ids: list[str] | None = None,
 ) -> list[dict]:
     results: list[dict] = []
     for contact_id in contact_ids:
         try:
             draft = await generate_draft_for_contact(
-                db, contact_id, custom_instructions=custom_instructions, objective=objective
+                db,
+                contact_id,
+                custom_instructions=custom_instructions,
+                objective=objective,
+                mailbox_ids=mailbox_ids,
             )
             results.append({"contact_id": contact_id, "draft_id": draft.id, "status": "ok"})
         except Exception as exc:
@@ -335,6 +350,53 @@ def set_draft_mailbox(db: Session, draft_id: str, mailbox_id: str) -> EmailDraft
     return draft
 
 
+def resolve_source_mailbox(
+    db: Session, contact_id: str, allowed_mailbox_ids: list[str] | None = None
+) -> str | None:
+    """Which mailbox should write to this contact: the one that already knows them.
+
+    Replying from the address a relationship actually lives on is what the recipient expects,
+    so a contact reached through the Galaxy mailbox is written to from Galaxy, not from
+    whichever mailbox happens to be first in the config.
+
+    Chosen by message volume, with the most recent contact breaking ties. Restricted to
+    ``allowed_mailbox_ids`` when the caller searched a specific set - if only one mailbox was
+    searched, every draft comes from it, which is the single-mailbox case.
+    """
+    query = (
+        db.query(
+            EmailMessage.mailbox_id,
+            func.count(EmailMessage.id).label("n"),
+            func.max(EmailMessage.sent_datetime).label("latest"),
+        )
+        .join(ContactEmailLink, ContactEmailLink.email_message_id == EmailMessage.id)
+        .filter(ContactEmailLink.contact_id == contact_id, EmailMessage.mailbox_id.isnot(None))
+        .group_by(EmailMessage.mailbox_id)
+    )
+    if allowed_mailbox_ids:
+        query = query.filter(EmailMessage.mailbox_id.in_(allowed_mailbox_ids))
+
+    rows = query.all()
+    sendable = []
+    for mailbox_id, count, latest in rows:
+        try:
+            mailbox = get_mailbox(mailbox_id)
+        except MailboxConfigError:
+            continue  # configured away since the mail was imported
+        if mailbox.can_send:
+            sendable.append((count, latest, mailbox_id))
+
+    if sendable:
+        sendable.sort(key=lambda row: (row[0], row[1] or datetime.min), reverse=True)
+        return sendable[0][2]
+
+    # No correspondence in the searched mailboxes: fall back to the only one searched, else
+    # leave it unset so the existing default applies.
+    if allowed_mailbox_ids and len(allowed_mailbox_ids) == 1:
+        return allowed_mailbox_ids[0]
+    return None
+
+
 def _resolve_send_mailbox(draft: EmailDraft, mailbox_id: str | None):
     """Pick the mailbox for a send: explicit arg → pinned on draft → first configured.
 
@@ -405,6 +467,42 @@ async def send_draft(db: Session, draft_id: str, *, mailbox_id: str | None = Non
     db.commit()
     db.refresh(draft)
     return draft
+
+
+async def send_drafts(
+    db: Session, draft_ids: list[str], *, mailbox_id: str | None = None
+) -> list[dict]:
+    """Send a specific set of drafts, each from its own pinned mailbox.
+
+    ``mailbox_id`` overrides every draft and is for the case where the sender genuinely wants
+    one identity for the whole batch. Left unset - the normal path - each draft goes out from
+    the mailbox that already corresponds with its recipient.
+    """
+    if not draft_ids:
+        raise OutreachError("No drafts selected")
+
+    drafts = db.query(EmailDraft).filter(EmailDraft.id.in_(draft_ids)).all()
+    found = {d.id for d in drafts}
+
+    results: list[dict] = []
+    for draft_id in draft_ids:
+        if draft_id not in found:
+            results.append({"draft_id": draft_id, "status": "error", "error": "Draft not found"})
+            continue
+        try:
+            sent = await send_draft(db, draft_id, mailbox_id=mailbox_id)
+            results.append(
+                {
+                    "draft_id": draft_id,
+                    "status": "sent",
+                    "mailbox_id": sent.sending_mailbox_id,
+                    "to": sent.contact.primary_email if sent.contact else None,
+                }
+            )
+        except Exception as exc:
+            # One bad recipient must not stop the rest of the batch.
+            results.append({"draft_id": draft_id, "status": "error", "error": str(exc)})
+    return results
 
 
 async def send_approved_drafts(db: Session, *, mailbox_id: str | None = None) -> list[dict]:

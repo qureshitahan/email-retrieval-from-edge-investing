@@ -877,6 +877,130 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- draft review cards --- */
+.draft-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.draft-card {
+  border: 1px solid #e4e8ee;
+  border-radius: 12px;
+  background: white;
+  padding: 14px 16px;
+}
+
+.draft-card.selected {
+  border-color: #bfdbfe;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.08);
+}
+
+.draft-card.sent {
+  opacity: 0.72;
+  background: #f8fafc;
+}
+
+.draft-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #eef0f4;
+  margin-bottom: 10px;
+}
+
+.draft-card-who {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.draft-card-sub {
+  display: block;
+  color: #5b6475;
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+
+.draft-card-step {
+  font-size: 0.74rem;
+  color: #98a2b3;
+  white-space: nowrap;
+}
+
+.draft-field {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 10px;
+  align-items: start;
+  margin-bottom: 8px;
+}
+
+.draft-field > label {
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #98a2b3;
+  padding-top: 8px;
+  margin: 0;
+}
+
+.draft-field input,
+.draft-field select,
+.draft-field textarea {
+  width: 100%;
+}
+
+.draft-to {
+  padding-top: 8px;
+  font-size: 0.85rem;
+  color: #344054;
+}
+
+.draft-lines {
+  margin-left: 88px;
+  font-size: 0.74rem;
+  color: #5b6475;
+}
+
+.draft-lines.over {
+  color: #b42318;
+}
+
+.draft-card-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #eef0f4;
+}
+
+.link-btn.danger {
+  color: #b42318;
+}
+
+.send-all-row {
+  margin: 10px 0 4px;
+}
+
+@media (max-width: 720px) {
+  .draft-field {
+    grid-template-columns: 1fr;
+  }
+  .draft-lines {
+    margin-left: 0;
+  }
+}
+
 /* --- per-mailbox sync progress --- */
 .sync-progress {
   display: flex;
