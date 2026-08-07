@@ -973,6 +973,209 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- bulk drafting progress --- */
+.draft-progress {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  background: #f6f9ff;
+}
+
+.draft-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 0.86rem;
+  color: #1f2a44;
+}
+
+.draft-progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #dfe8f8;
+  overflow: hidden;
+}
+
+.draft-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: #2d4ed8;
+  transition: width 0.4s ease;
+}
+
+/* The study phase has no per-item progress to report, so the bar animates instead of sitting
+   at zero and looking stalled. */
+.draft-progress-bar.indeterminate {
+  animation: draft-progress-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes draft-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Who is written and who is still queued. Scrolls rather than pushing the page down on a
+   batch of fifty. */
+.draft-queue {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  max-height: 210px;
+  overflow-y: auto;
+  border-top: 1px solid #dfe8f8;
+}
+
+.draft-queue-item {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 2px;
+  font-size: 0.82rem;
+  border-bottom: 1px solid #edf2fb;
+}
+
+.draft-queue-item:last-child {
+  border-bottom: 0;
+}
+
+.draft-queue-mark {
+  text-align: center;
+  font-weight: 700;
+  color: #98a2b3;
+}
+
+.draft-queue-item.done .draft-queue-mark {
+  color: #128a5b;
+}
+
+.draft-queue-item.writing .draft-queue-mark {
+  color: #2d4ed8;
+}
+
+.draft-queue-item.failed .draft-queue-mark {
+  color: #b42318;
+}
+
+.draft-queue-name {
+  color: #344054;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.draft-queue-item.writing .draft-queue-name {
+  font-weight: 600;
+  color: #1f2a44;
+}
+
+.draft-queue-item.pending .draft-queue-name,
+.draft-queue-item.skipped .draft-queue-name {
+  color: #8a93a5;
+}
+
+/* --- what the draft was personalised on --- */
+.draft-brief {
+  margin: 4px 0 12px 88px;
+  padding: 10px 12px;
+  border: 1px solid #d6e4ff;
+  border-left: 3px solid #4f75d1;
+  border-radius: 8px;
+  background: #f6f9ff;
+}
+
+.draft-brief.empty {
+  border-color: #e7e9ee;
+  border-left-color: #c3c8d2;
+  background: #fafbfc;
+  display: grid;
+  gap: 2px;
+}
+
+.draft-brief-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.draft-brief-title {
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #3f5fa8;
+}
+
+.draft-brief.empty .draft-brief-title {
+  color: #6b7280;
+}
+
+.draft-brief-count {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: #4f75d1;
+  color: white;
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.draft-brief-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.draft-brief-headline {
+  display: block;
+  font-size: 0.85rem;
+  color: #1f2a44;
+  font-weight: 600;
+}
+
+.draft-brief-quote {
+  margin: 5px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid #c7d7f5;
+  font-size: 0.8rem;
+  color: #435068;
+  font-style: italic;
+}
+
+.draft-brief-quote cite {
+  display: block;
+  margin-top: 3px;
+  font-style: normal;
+  font-size: 0.72rem;
+  color: #8a93a5;
+}
+
+.draft-brief-focus,
+.draft-brief-note {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e2eaf8;
+}
+
 .draft-card-foot {
   display: flex;
   justify-content: space-between;
@@ -997,6 +1200,9 @@ th .info-tip-popover::before {
     grid-template-columns: 1fr;
   }
   .draft-lines {
+    margin-left: 0;
+  }
+  .draft-brief {
     margin-left: 0;
   }
 }

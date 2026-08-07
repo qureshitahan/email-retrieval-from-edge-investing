@@ -76,6 +76,26 @@ export type SyncRun = {
   completed_at: string | null;
 };
 
+/** One thing the recipient has been doing, quoted from their own mail. */
+export type ActivityNugget = {
+  headline: string | null;
+  detail: string | null;
+  quote: string | null;
+  date: string | null;
+  said_by: "them" | "us" | null;
+  is_recent: boolean;
+  source_subject: string | null;
+};
+
+/** The evidence behind a draft's opening line, shown before it is sent. */
+export type Personalization = {
+  activity: ActivityNugget[];
+  focus: string[];
+  note: string;
+  studied_messages: number;
+  reason: string;
+};
+
 export type EmailDraft = {
   id: string;
   contact_id: string;
@@ -86,6 +106,7 @@ export type EmailDraft = {
   body: string | null;
   status: string;
   sending_mailbox_id: string | null;
+  personalization: Personalization | null;
   custom_instructions: string | null;
   system_prompt: string | null;
   user_prompt: string | null;
@@ -93,6 +114,41 @@ export type EmailDraft = {
   sent_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/** One person's place in a drafting run — written, in hand, or still queued. */
+export type DraftRunPerson = {
+  contact_id: string;
+  name: string;
+  status: "done" | "writing" | "pending" | "failed" | "skipped";
+  draft_id: string | null;
+  error: string | null;
+};
+
+/** Progress of a background drafting run. */
+export type DraftRun = {
+  id: string;
+  status: "running" | "completed" | "failed";
+  phase: "studying" | "writing" | "done";
+  total: number;
+  completed: number;
+  failed: number;
+  done: number;
+  percent: number;
+  current_label: string | null;
+  objective: string | null;
+  draft_ids: string[];
+  errors: Array<{ contact_id: string; error: string }>;
+  error_message: string | null;
+  started_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  /** Everyone in the batch and where each one has got to. */
+  people?: DraftRunPerson[];
+  /** Present on poll responses: the drafts finished so far. */
+  items?: EmailDraft[];
+  /** Present on start responses: true when attaching to a run already in flight. */
+  already_running?: boolean;
 };
 
 export type Mailbox = {
@@ -314,6 +370,30 @@ export const api = {
         }),
       }
     ),
+  /**
+   * Queue a bulk drafting run and return at once.
+   *
+   * The synchronous `generateDrafts` above is kept for one-off use, but a batch must not be
+   * written inside a single request: Azure closes the connection after 230 seconds and the
+   * browser reports "Failed to fetch" while the server is still working. Poll `draftRun`.
+   */
+  startDrafting: (
+    contactIds: string[],
+    customInstructions?: string,
+    objective?: string,
+    mailboxIds: string[] = []
+  ) =>
+    apiFetch<DraftRun>("/outreach/drafts/start", {
+      method: "POST",
+      body: JSON.stringify({
+        contact_ids: contactIds,
+        custom_instructions: customInstructions || null,
+        objective: objective || null,
+        mailbox_ids: mailboxIds,
+      }),
+    }),
+  draftRun: (runId: string) => apiFetch<DraftRun>(`/outreach/drafts/runs/${runId}`),
+  latestDraftRun: () => apiFetch<DraftRun | null>("/outreach/drafts/runs/latest"),
   generateDraftForContact: (contactId: string, customInstructions?: string, objective?: string) =>
     apiFetch<EmailDraft>(`/outreach/contacts/${contactId}/generate`, {
       method: "POST",

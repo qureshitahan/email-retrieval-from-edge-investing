@@ -89,6 +89,9 @@ class ContactContext(Base):
     ai_relationship_context: Mapped[str | None] = mapped_column(Text)
     ai_follow_up_draft: Mapped[str | None] = mapped_column(Text)
     ai_contact_classification: Mapped[dict | None] = mapped_column(JSON)
+    # Verified facts about what this person has been doing lately, from personal_brief.
+    # Cached here because the study pass reads full message bodies over the network.
+    ai_personal_brief: Mapped[dict | None] = mapped_column(JSON)
     ai_summary_generated_at: Mapped[datetime | None] = mapped_column(DateTime)
     ai_model_used: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

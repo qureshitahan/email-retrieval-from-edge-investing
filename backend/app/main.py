@@ -27,6 +27,7 @@ def on_startup() -> None:
     # "running" now belongs to a restart or crash, and left alone it blocks every future
     # sync because the start guard treats it as in flight.
     from app.database import SessionLocal
+    from app.services.outreach_service import reap_stale_draft_runs
     from app.services.sync_service import reap_interrupted_runs
 
     db = SessionLocal()
@@ -34,6 +35,13 @@ def on_startup() -> None:
         reaped = reap_interrupted_runs(db)
         if reaped:
             print(f"[startup] marked {reaped} interrupted sync run(s) as failed")
+        # Drafting runs die with the process for the same reason and block the next batch in
+        # the same way. On startup nothing can still be running, so age is not a factor.
+        from datetime import timedelta
+
+        stale = reap_stale_draft_runs(db, older_than=timedelta(0))
+        if stale:
+            print(f"[startup] marked {stale} interrupted drafting run(s) as failed")
     finally:
         db.close()
 

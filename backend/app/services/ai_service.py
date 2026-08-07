@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 from html import unescape
@@ -28,11 +29,22 @@ class AIServiceError(Exception):
     pass
 
 
+# The SDK waits ten minutes by default. One stalled call then holds up a whole batch: live
+# drafting runs have shown per-draft times of 4 seconds and, occasionally, 74. Bounding the
+# wait turns a hung call into a fast failure that falls through to the next model.
+ANTHROPIC_TIMEOUT_SECONDS = 90.0
+ANTHROPIC_MAX_RETRIES = 1
+
+
 def _get_client() -> Anthropic:
     settings = get_settings()
     if not settings.anthropic_api_key:
         raise AIServiceError("ANTHROPIC_API_KEY is not configured in .env")
-    return Anthropic(api_key=settings.anthropic_api_key)
+    return Anthropic(
+        api_key=settings.anthropic_api_key,
+        timeout=ANTHROPIC_TIMEOUT_SECONDS,
+        max_retries=ANTHROPIC_MAX_RETRIES,
+    )
 
 
 def _get_contact(db: Session, contact_id: str) -> Contact:
@@ -224,6 +236,17 @@ def _call_anthropic(system: str, user_prompt: str, *, max_tokens: int = 1500) ->
     raise AIServiceError(f"Anthropic API failed for all models: {last_error}")
 
 
+async def _call_anthropic_async(system: str, user_prompt: str, *, max_tokens: int = 1500) -> str:
+    """``_call_anthropic`` off the event loop.
+
+    The Anthropic client is synchronous, so calling it from a coroutine stops the server dead
+    for the duration — measured at 60 seconds during an eight-email batch, which froze the
+    progress polls, every other request, and the health check that Azure uses to decide whether
+    to recycle the container. Every await point in a request path must use this.
+    """
+    return await asyncio.to_thread(_call_anthropic, system, user_prompt, max_tokens=max_tokens)
+
+
 def _ensure_context_row(db: Session, contact: Contact) -> ContactContext:
     if contact.context:
         return contact.context
@@ -242,7 +265,7 @@ async def generate_summary(db: Session, contact_id: str, *, force: bool = False)
 
     messages = _contact_messages(db, contact_id)
     prompt_context = build_metadata_context(contact, messages)
-    summary = _call_anthropic(
+    summary = await _call_anthropic_async(
         "You are a relationship intelligence assistant for Edge Investing / Galaxy Pharma fundraising and business development.",
         f"""Based on sent email metadata below, write a concise relationship summary covering:
 - Who is this person and what company are they associated with?
@@ -341,7 +364,7 @@ async def generate_relationship_context(
         evidence=format_relationship_evidence(evidence),
     )
 
-    insight = _call_anthropic(RELATIONSHIP_SYSTEM_PROMPT, user_prompt)
+    insight = await _call_anthropic_async(RELATIONSHIP_SYSTEM_PROMPT, user_prompt)
 
     if not objective:
         ctx.ai_relationship_context = insight
@@ -370,7 +393,7 @@ async def generate_follow_up(db: Session, contact_id: str, *, force: bool = Fals
     if ctx.ai_summary:
         prompt_context += f"\n\nExisting AI summary:\n{ctx.ai_summary}"
 
-    draft = _call_anthropic(
+    draft = await _call_anthropic_async(
         "You write professional, warm follow-up emails for Edge Investing / Galaxy Pharma.",
         f"""Draft a short follow-up email to this contact based on the relationship history below.
 - Professional but personable tone
@@ -400,7 +423,7 @@ async def classify_contact(db: Session, contact_id: str, *, force: bool = False)
 
     messages = _contact_messages(db, contact_id)
     prompt_context = build_metadata_context(contact, messages)
-    raw = _call_anthropic(
+    raw = await _call_anthropic_async(
         "You classify business contacts for a healthcare investment firm.",
         f"""Classify this contact. Reply in this exact JSON format only (no markdown):
 {{"contact_type": "investor|family_office|pharma|healthcare|advisor|vendor|legal|board|intro|other", "confidence": "high|medium|low", "reason": "one sentence"}}
@@ -434,7 +457,7 @@ async def summarize_threads(db: Session, contact_id: str, *, force: bool = False
             return {"summary": ctx.ai_summary, "cached": True, "generated_at": ctx.ai_summary_generated_at}
 
     full_context = await build_full_context(db, contact_id)
-    summary = _call_anthropic(
+    summary = await _call_anthropic_async(
         "You summarize email thread history for fundraising and BD relationship management. "
         "The grounding states who wrote each message - treat that as the most important thing "
         "on the page and never attribute their words to us or ours to them. Never open with, or "
