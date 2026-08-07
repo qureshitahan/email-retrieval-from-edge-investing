@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.contact import Contact, ContactEmailLink
 from app.models.message import EmailMessage
-from app.models.outreach import EmailDraft, OutreachPrompt
-from app.services.ai_service import _call_anthropic, build_metadata_context, _contact_messages, _get_contact
+from app.models.outreach import DraftRun, EmailDraft, OutreachPrompt
+from app.services.ai_service import (
+    _call_anthropic_async,
+    _contact_messages,
+    _get_contact,
+    build_metadata_context,
+)
 from app.services.graph_client import GraphAuthError, GraphClient
 from app.services.personal_brief import (
     format_personal_brief,
@@ -353,7 +358,9 @@ async def generate_draft_for_contact(
 
     user_prompt = build_user_prompt(prompt_row.user_prompt_template, context, instructions)
 
-    raw = _call_anthropic(prompt_row.system_prompt, user_prompt)
+    # Off the event loop: a blocking call here freezes progress polls, every other request,
+    # and the health check Azure uses to decide whether the container is alive.
+    raw = await _call_anthropic_async(prompt_row.system_prompt, user_prompt)
     subject, body = _parse_draft_response(raw)
 
     existing = (
@@ -416,6 +423,252 @@ async def generate_drafts_bulk(
         except Exception as exc:
             results.append({"contact_id": contact_id, "status": "error", "error": str(exc)})
     return results
+
+
+# A job whose process died leaves a row saying "running" forever. Anything older than this with
+# no progress is treated as dead so the next request is not refused on its behalf.
+STALE_DRAFT_RUN_MINUTES = 30
+
+
+class DraftRunAlreadyActive(OutreachError):
+    def __init__(self, run: DraftRun) -> None:
+        super().__init__(
+            f"A drafting run is already in progress ({run.completed}/{run.total} done)"
+        )
+        self.run = run
+
+
+def draft_run_to_dict(run: DraftRun) -> dict:
+    done = run.completed + run.failed
+    return {
+        "id": run.id,
+        "status": run.status,
+        "phase": run.phase,
+        "total": run.total,
+        "completed": run.completed,
+        "failed": run.failed,
+        "done": done,
+        "percent": int(round(100 * done / run.total)) if run.total else 0,
+        "current_label": run.current_label,
+        "objective": run.objective,
+        "draft_ids": run.draft_ids or [],
+        "errors": run.errors or [],
+        "error_message": run.error_message,
+        "started_at": run.started_at,
+        "updated_at": run.updated_at,
+        "completed_at": run.completed_at,
+    }
+
+
+def draft_run_people(db: Session, run: DraftRun) -> list[dict]:
+    """Per-person state for the progress list: who is written, who is next, who failed.
+
+    A percentage tells you how much is left but not whose email exists yet, which is the thing
+    worth knowing when a batch is part way through. Derived from what has actually been
+    written rather than from a counter, so it stays honest if a run is interrupted.
+    """
+    contact_ids = list(run.contact_ids or [])
+    if not contact_ids:
+        return []
+
+    drafted: dict[str, str] = {}
+    for draft in drafts_by_ids(db, run.draft_ids or []):
+        drafted[draft.contact_id] = draft.id
+
+    failures = {
+        entry.get("contact_id"): entry.get("error")
+        for entry in (run.errors or [])
+        if isinstance(entry, dict)
+    }
+
+    names = {
+        contact.id: (contact.full_name or contact.primary_email)
+        for contact in db.query(Contact).filter(Contact.id.in_(contact_ids)).all()
+    }
+
+    # Contacts are written in the order they were queued, so the first unfinished one is the
+    # one in hand. Only meaningful while the run is live.
+    finished = run.completed + run.failed
+    people: list[dict] = []
+    for index, contact_id in enumerate(contact_ids):
+        if contact_id in failures:
+            status = "failed"
+        elif contact_id in drafted:
+            status = "done"
+        elif run.status == "running" and index == finished and run.phase == "writing":
+            status = "writing"
+        elif run.status == "running":
+            status = "pending"
+        else:
+            status = "skipped"
+        people.append(
+            {
+                "contact_id": contact_id,
+                "name": names.get(contact_id, contact_id),
+                "status": status,
+                "draft_id": drafted.get(contact_id),
+                "error": failures.get(contact_id),
+            }
+        )
+    return people
+
+
+def reap_stale_draft_runs(db: Session, *, older_than: timedelta | None = None) -> int:
+    """Close out runs whose process is gone.
+
+    Without this a restart mid-batch — a deploy, a container recycle — leaves a row at
+    "running" and every later attempt is rejected as a duplicate of a job that is not there.
+    """
+    cutoff = datetime.utcnow() - (older_than or timedelta(minutes=STALE_DRAFT_RUN_MINUTES))
+    stale = (
+        db.query(DraftRun)
+        .filter(DraftRun.status == "running", DraftRun.updated_at < cutoff)
+        .all()
+    )
+    for run in stale:
+        run.status = "failed"
+        run.error_message = "Interrupted — the server restarted while this run was in progress."
+        run.completed_at = datetime.utcnow()
+    if stale:
+        db.commit()
+    return len(stale)
+
+
+def active_draft_run(db: Session) -> DraftRun | None:
+    reap_stale_draft_runs(db)
+    return (
+        db.query(DraftRun)
+        .filter(DraftRun.status == "running")
+        .order_by(DraftRun.started_at.desc())
+        .first()
+    )
+
+
+def latest_draft_run(db: Session) -> DraftRun | None:
+    reap_stale_draft_runs(db)
+    return db.query(DraftRun).order_by(DraftRun.started_at.desc()).first()
+
+
+def create_draft_run(
+    db: Session,
+    contact_ids: list[str],
+    *,
+    custom_instructions: str | None = None,
+    objective: str | None = None,
+    mailbox_ids: list[str] | None = None,
+) -> DraftRun:
+    """Queue a bulk drafting job. Raises if one is already running.
+
+    Two concurrent runs over overlapping contacts would fight over the same draft rows, so the
+    caller is handed the existing run instead of quietly starting a second one.
+    """
+    if not contact_ids:
+        raise OutreachError("Select at least one contact")
+
+    existing = active_draft_run(db)
+    if existing is not None:
+        raise DraftRunAlreadyActive(existing)
+
+    run = DraftRun(
+        status="running",
+        phase="studying",
+        total=len(contact_ids),
+        contact_ids=list(contact_ids),
+        mailbox_ids=list(mailbox_ids or []),
+        objective=objective,
+        custom_instructions=custom_instructions,
+        draft_ids=[],
+        errors=[],
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+async def run_draft_job(db_factory, run_id: str) -> None:
+    """Execute a queued drafting run. Owns its own session — it outlives the request.
+
+    Progress is committed after every contact so the polling endpoint reflects real work, and
+    so a run interrupted halfway leaves its finished drafts behind rather than losing them.
+    """
+    db = db_factory()
+    try:
+        run = db.query(DraftRun).filter(DraftRun.id == run_id).one_or_none()
+        if run is None:
+            return
+        contact_ids = list(run.contact_ids or [])
+
+        try:
+            contacts = _contacts_for(db, contact_ids)
+            by_id = {c.id: c for c in contacts}
+
+            run.phase = "studying"
+            run.current_label = f"Reading recent mail for {len(contacts)} people"
+            run.updated_at = datetime.utcnow()
+            db.commit()
+
+            await prewarm_briefs(db, contacts)
+
+            run.phase = "writing"
+            db.commit()
+
+            draft_ids: list[str] = []
+            errors: list[dict] = []
+            for contact_id in contact_ids:
+                contact = by_id.get(contact_id)
+                run.current_label = (
+                    contact.full_name or contact.primary_email if contact else contact_id
+                )
+                run.updated_at = datetime.utcnow()
+                db.commit()
+                try:
+                    draft = await generate_draft_for_contact(
+                        db,
+                        contact_id,
+                        custom_instructions=run.custom_instructions,
+                        objective=run.objective,
+                        mailbox_ids=run.mailbox_ids or None,
+                    )
+                    draft_ids.append(draft.id)
+                    run.completed += 1
+                except Exception as exc:  # noqa: BLE001 - one bad contact must not stop the batch
+                    errors.append({"contact_id": contact_id, "error": str(exc)})
+                    run.failed += 1
+                # Reassigned rather than appended: SQLAlchemy only notices a JSON column
+                # changing when the attribute itself is set.
+                run.draft_ids = list(draft_ids)
+                run.errors = list(errors)
+                run.updated_at = datetime.utcnow()
+                db.commit()
+
+            run.status = "completed"
+            run.phase = "done"
+            run.current_label = None
+            run.completed_at = datetime.utcnow()
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            run.status = "failed"
+            run.error_message = str(exc)
+            run.completed_at = datetime.utcnow()
+            db.commit()
+            raise
+    finally:
+        db.close()
+
+
+def drafts_by_ids(db: Session, draft_ids: list[str]) -> list[EmailDraft]:
+    """The named drafts, in the order requested, so the UI can show them as they appear."""
+    if not draft_ids:
+        return []
+    rows = (
+        db.query(EmailDraft)
+        .options(joinedload(EmailDraft.contact))
+        .filter(EmailDraft.id.in_(draft_ids))
+        .all()
+    )
+    by_id = {row.id: row for row in rows}
+    return [by_id[draft_id] for draft_id in draft_ids if draft_id in by_id]
 
 
 def list_drafts(db: Session, status: str | None = None) -> list[EmailDraft]:

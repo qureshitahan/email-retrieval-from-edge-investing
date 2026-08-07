@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { DraftCard } from "@/components/DraftCard";
 import { Nav } from "@/components/Nav";
-import { api, EmailDraft, MailboxStatus, RankedContact } from "@/lib/api";
+import { api, DraftRun, EmailDraft, MailboxStatus, RankedContact } from "@/lib/api";
 
 /**
  * Objective-first outreach.
@@ -37,6 +37,10 @@ export default function CompassPage() {
 
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
   const [selectedDrafts, setSelectedDrafts] = useState<Set<string>>(new Set());
+  const [draftRun, setDraftRun] = useState<DraftRun | null>(null);
+  // Which run the poll loop is following, so a second one cannot start alongside it and a
+  // navigation away can stop it.
+  const draftPollRef = useRef<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
@@ -67,6 +71,33 @@ export default function CompassPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // A run started before a reload is still going on the server. Attach to it rather than
+  // leaving the page looking idle while emails are being written — and pick up the drafts of
+  // a run that finished while the tab was closed.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const run = await api.latestDraftRun();
+        if (cancelled || !run) return;
+        if (run.items?.length) {
+          setDrafts(run.items);
+          setSelectedDrafts(new Set(run.items.filter((d) => d.status !== "sent").map((d) => d.id)));
+        }
+        setDraftRun(run);
+        if (run.status === "running") followDraftRun(run.id);
+      } catch {
+        // Nothing in flight, or the API is not up yet. Neither is worth an error banner.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      draftPollRef.current = null;
+    };
+    // Mount only: re-running this on every objective keystroke would restart the poll loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function toggleMailbox(id: string) {
     setIncluded((prev) => {
@@ -163,7 +194,7 @@ export default function CompassPage() {
     setDrafting(true);
     setError(null);
     try {
-      const result = await api.generateDrafts(
+      const run = await api.startDrafting(
         chosen.map((r) => r.contact_id),
         undefined,
         objective.trim(),
@@ -171,19 +202,76 @@ export default function CompassPage() {
         // corresponds with its recipient.
         Array.from(included)
       );
-      const failed = result.results?.filter((r) => r.status === "error") || [];
-      setDrafts(result.items);
-      setSelectedDrafts(new Set(result.items.map((d) => d.id)));
-      setNotice(
-        `Drafted ${result.items.length} email(s) for "${objective.trim()}". Review them below, ` +
-          `then send.` + (failed.length ? ` ${failed.length} could not be drafted.` : "")
-      );
+      if (run.already_running) {
+        setNotice("A drafting run was already going — showing its progress.");
+      }
+      await followDraftRun(run.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Drafting failed");
-    } finally {
       setDrafting(false);
     }
   }
+
+  /**
+   * Watch a drafting run to completion, showing each email as it is written.
+   *
+   * Nothing here holds a long request open. That is the point: a batch of forty takes several
+   * minutes, and Azure closes any connection idle for 230 seconds, which used to surface as
+   * "Failed to fetch" on precisely the large batches this flow is built to produce. Each poll
+   * is its own short request, so batch size no longer has anything to do with it.
+   */
+  const followDraftRun = useCallback(
+    async (runId: string) => {
+      setDrafting(true);
+      draftPollRef.current = runId;
+      let misses = 0;
+
+      while (draftPollRef.current === runId) {
+        let run: DraftRun;
+        try {
+          run = await api.draftRun(runId);
+          misses = 0;
+        } catch {
+          // A dropped poll is not a failed run — the work continues on the server. Keep
+          // trying for a while before giving up on watching it.
+          misses += 1;
+          if (misses >= 5) {
+            setError("Lost contact with the server. The drafts are still being written — reload to pick them up.");
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+
+        setDraftRun(run);
+        if (run.items) {
+          setDrafts(run.items);
+          setSelectedDrafts(new Set(run.items.map((d) => d.id)));
+        }
+
+        if (run.status !== "running") {
+          const failed = run.failed;
+          if (run.status === "failed" && run.error_message) {
+            setError(run.error_message);
+          } else {
+            setNotice(
+              `Drafted ${run.completed} email(s) for "${run.objective || objective.trim()}". ` +
+                `Review them below, then send.` +
+                (failed ? ` ${failed} could not be drafted.` : "")
+            );
+          }
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+
+      if (draftPollRef.current === runId) {
+        draftPollRef.current = null;
+        setDrafting(false);
+      }
+    },
+    [objective]
+  );
 
   function patchDraft(id: string, patch: Partial<EmailDraft>) {
     setDrafts((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
@@ -484,6 +572,62 @@ export default function CompassPage() {
               {drafting ? "Drafting…" : `Draft ${selected.size} personalised emails`}
             </button>
           </div>
+
+          {draftRun && (drafting || draftRun.status === "running") && (
+            <div className="draft-progress">
+              <div className="draft-progress-head">
+                <span>
+                  {draftRun.phase === "studying"
+                    ? "Reading their recent mail…"
+                    : `Writing ${draftRun.done + 1} of ${draftRun.total}`}
+                  {draftRun.current_label && draftRun.phase === "writing" && (
+                    <span className="meta"> · {draftRun.current_label}</span>
+                  )}
+                </span>
+                <span className="meta">{draftRun.percent}%</span>
+              </div>
+              <div className="draft-progress-track">
+                <div
+                  className={`draft-progress-bar${draftRun.phase === "studying" ? " indeterminate" : ""}`}
+                  style={{ width: `${Math.max(draftRun.percent, 3)}%` }}
+                />
+              </div>
+              {draftRun.people && draftRun.people.length > 0 && (
+                <ul className="draft-queue">
+                  {draftRun.people.map((person) => (
+                    <li key={person.contact_id} className={`draft-queue-item ${person.status}`}>
+                      <span className="draft-queue-mark" aria-hidden="true">
+                        {person.status === "done"
+                          ? "✓"
+                          : person.status === "failed"
+                            ? "!"
+                            : person.status === "writing"
+                              ? "…"
+                              : "○"}
+                      </span>
+                      <span className="draft-queue-name">{person.name}</span>
+                      <span className="meta">
+                        {person.status === "done"
+                          ? "drafted"
+                          : person.status === "writing"
+                            ? "writing now"
+                            : person.status === "failed"
+                              ? person.error || "failed"
+                              : person.status === "skipped"
+                                ? "not drafted"
+                                : "waiting"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <span className="meta">
+                This keeps running if you close the tab — reopen Compass to pick it up.
+                {draftRun.failed > 0 && ` ${draftRun.failed} could not be drafted so far.`}
+              </span>
+            </div>
+          )}
 
           <div className="ranked-list">
             {ranked.map((r, i) => (

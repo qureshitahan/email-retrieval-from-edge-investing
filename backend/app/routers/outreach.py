@@ -1,20 +1,28 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
+from app.models.outreach import DraftRun
 from app.services.ai_service import AIServiceError
 from app.services.mailboxes import MailboxConfigError, load_mailboxes
 from app.services.prioritization import prioritize_contacts
 from app.services.outreach_service import (
+    DraftRunAlreadyActive,
     OutreachError,
+    create_draft_run,
+    draft_run_people,
+    draft_run_to_dict,
     draft_to_dict,
+    drafts_by_ids,
     generate_draft_for_contact,
     generate_drafts_bulk,
     get_prompt_config,
+    latest_draft_run,
     list_drafts,
+    run_draft_job,
     send_approved_drafts,
     send_draft,
     send_drafts,
@@ -150,6 +158,70 @@ async def post_generate_drafts(payload: GenerateDraftsRequest, db: Session = Dep
     by_id = {d.id: d for d in drafts}
     items = [draft_to_dict(by_id[did]) for did in draft_ids if did in by_id]
     return {"results": results, "items": items}
+
+
+@router.post("/drafts/start")
+def post_start_drafting(
+    payload: GenerateDraftsRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Queue a bulk drafting run and return immediately.
+
+    Writing a batch takes minutes; a single request that long is closed by Azure's front end
+    at 230 seconds, which the browser reports as "Failed to fetch" even though the server is
+    still working. The client polls ``/drafts/runs/{id}`` instead.
+    """
+    if not payload.contact_ids:
+        raise HTTPException(status_code=400, detail="Select at least one contact")
+    try:
+        run = create_draft_run(
+            db,
+            payload.contact_ids,
+            custom_instructions=payload.custom_instructions,
+            objective=payload.objective,
+            mailbox_ids=payload.mailbox_ids or None,
+        )
+    except DraftRunAlreadyActive as exc:
+        # Not an error worth stopping for: hand back the run in progress so the page attaches
+        # to it rather than starting a competing one.
+        return {
+            **draft_run_to_dict(exc.run),
+            "people": draft_run_people(db, exc.run),
+            "already_running": True,
+        }
+    except OutreachError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    background_tasks.add_task(run_draft_job, SessionLocal, run.id)
+    # The list ships with the response so the queue is on screen before any work is done.
+    return {**draft_run_to_dict(run), "people": draft_run_people(db, run), "already_running": False}
+
+
+@router.get("/drafts/runs/latest")
+def get_latest_draft_run(db: Session = Depends(get_db)):
+    """The most recent run, so a reloaded page can rejoin one already in flight."""
+    run = latest_draft_run(db)
+    if run is None:
+        return None
+    return {
+        **draft_run_to_dict(run),
+        "people": draft_run_people(db, run),
+        "items": [draft_to_dict(d) for d in drafts_by_ids(db, run.draft_ids or [])],
+    }
+
+
+@router.get("/drafts/runs/{run_id}")
+def get_draft_run(run_id: str, db: Session = Depends(get_db)):
+    """Progress plus the drafts finished so far, so they appear as they are written."""
+    run = db.query(DraftRun).filter(DraftRun.id == run_id).one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Drafting run not found")
+    return {
+        **draft_run_to_dict(run),
+        "people": draft_run_people(db, run),
+        "items": [draft_to_dict(d) for d in drafts_by_ids(db, run.draft_ids or [])],
+    }
 
 
 @router.post("/contacts/{contact_id}/generate")

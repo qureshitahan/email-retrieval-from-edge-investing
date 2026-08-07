@@ -973,6 +973,116 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- bulk drafting progress --- */
+.draft-progress {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  background: #f6f9ff;
+}
+
+.draft-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 0.86rem;
+  color: #1f2a44;
+}
+
+.draft-progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #dfe8f8;
+  overflow: hidden;
+}
+
+.draft-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: #2d4ed8;
+  transition: width 0.4s ease;
+}
+
+/* The study phase has no per-item progress to report, so the bar animates instead of sitting
+   at zero and looking stalled. */
+.draft-progress-bar.indeterminate {
+  animation: draft-progress-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes draft-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Who is written and who is still queued. Scrolls rather than pushing the page down on a
+   batch of fifty. */
+.draft-queue {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  max-height: 210px;
+  overflow-y: auto;
+  border-top: 1px solid #dfe8f8;
+}
+
+.draft-queue-item {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 2px;
+  font-size: 0.82rem;
+  border-bottom: 1px solid #edf2fb;
+}
+
+.draft-queue-item:last-child {
+  border-bottom: 0;
+}
+
+.draft-queue-mark {
+  text-align: center;
+  font-weight: 700;
+  color: #98a2b3;
+}
+
+.draft-queue-item.done .draft-queue-mark {
+  color: #128a5b;
+}
+
+.draft-queue-item.writing .draft-queue-mark {
+  color: #2d4ed8;
+}
+
+.draft-queue-item.failed .draft-queue-mark {
+  color: #b42318;
+}
+
+.draft-queue-name {
+  color: #344054;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.draft-queue-item.writing .draft-queue-name {
+  font-weight: 600;
+  color: #1f2a44;
+}
+
+.draft-queue-item.pending .draft-queue-name,
+.draft-queue-item.skipped .draft-queue-name {
+  color: #8a93a5;
+}
+
 /* --- what the draft was personalised on --- */
 .draft-brief {
   margin: 4px 0 12px 88px;
