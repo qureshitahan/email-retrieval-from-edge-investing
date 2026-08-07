@@ -1,0 +1,30 @@
+# Normalise line endings so a checkout on Windows cannot produce files Linux refuses to run.
+#
+# Azure App Service executes `bash startup.sh` inside a Linux container. Git on Windows
+# checks shell scripts out with CRLF by default, and a script with CRLF fails there with
+# `cd: $'.\r': No such file or directory` and exits 2 - the container then crash-loops and
+# the site returns 503. Anything the Linux container executes or parses is pinned to LF.
+
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.css   text eol=lf
+*.md    text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+
+# Binary - never touch these.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.xlsx  binary
+*.db    binary

@@ -1,0 +1,8 @@
+# Also declared here, not only at the repo root: `git archive HEAD:frontend` treats this
+# directory as the archive root, so the root .gitattributes is out of scope for it. Azure
+# runs `bash startup.sh` in a Linux container, and CRLF makes that fail with exit code 2.
+*.sh text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+*.css text eol=lf
