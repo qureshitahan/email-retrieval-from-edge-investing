@@ -1,6 +1,74 @@
 "use client";
 
-import { EmailDraft, MailboxStatus } from "@/lib/api";
+import { useState } from "react";
+
+import { EmailDraft, MailboxStatus, Personalization } from "@/lib/api";
+
+/**
+ * What the draft was personalised on.
+ *
+ * Every line here was verified against the recipient's own mail before the draft was written,
+ * so this doubles as the check on the opening sentence: if the email congratulates someone on
+ * a deal, the quote that claim came from is one click away. When nothing was verified it says
+ * so plainly — an email that opens on the last message is a correct outcome, not a failure.
+ */
+function PersonalizationPanel({ data }: { data: Personalization }) {
+  const [open, setOpen] = useState(false);
+  const activity = data.activity || [];
+  const focus = data.focus || [];
+
+  if (activity.length === 0 && focus.length === 0) {
+    return (
+      <div className="draft-brief empty">
+        <span className="draft-brief-title">Nothing recent found about them</span>
+        <span className="meta">
+          {data.reason || "no concrete activity in the mail"} — opened on your last exchange
+          instead{data.studied_messages ? ` (read ${data.studied_messages} messages)` : ""}.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="draft-brief">
+      <button className="draft-brief-head" onClick={() => setOpen(!open)} type="button">
+        <span className="draft-brief-title">
+          What we know they&apos;re doing
+          {activity.length > 0 && <span className="draft-brief-count">{activity.length}</span>}
+        </span>
+        <span className="meta">{open ? "hide" : "show evidence"}</span>
+      </button>
+
+      <ul className="draft-brief-list">
+        {activity.map((item, i) => (
+          <li key={i}>
+            <span className="draft-brief-headline">{item.headline}</span>
+            <span className="meta">
+              {item.date || "date unknown"}
+              {item.said_by === "us" ? " · you said this to them" : " · they told you"}
+              {item.is_recent ? "" : " · over a year ago"}
+            </span>
+            {open && item.quote && (
+              <blockquote className="draft-brief-quote">
+                &ldquo;{item.quote}&rdquo;
+                {item.source_subject && (
+                  <cite> — {item.source_subject}</cite>
+                )}
+              </blockquote>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      {open && focus.length > 0 && (
+        <div className="draft-brief-focus">
+          <span className="meta">Working on: {focus.join(" · ")}</span>
+        </div>
+      )}
+      {open && data.note && <div className="meta draft-brief-note">{data.note}</div>}
+    </div>
+  );
+}
 
 /**
  * One draft, reviewed on its own before anything is sent.
@@ -82,6 +150,8 @@ export function DraftCard({
         <label>TO</label>
         <span className="draft-to">{draft.contact_email}</span>
       </div>
+
+      {draft.personalization && <PersonalizationPanel data={draft.personalization} />}
 
       <div className="draft-field">
         <label>SUBJECT</label>

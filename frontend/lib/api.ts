@@ -76,6 +76,26 @@ export type SyncRun = {
   completed_at: string | null;
 };
 
+/** One thing the recipient has been doing, quoted from their own mail. */
+export type ActivityNugget = {
+  headline: string | null;
+  detail: string | null;
+  quote: string | null;
+  date: string | null;
+  said_by: "them" | "us" | null;
+  is_recent: boolean;
+  source_subject: string | null;
+};
+
+/** The evidence behind a draft's opening line, shown before it is sent. */
+export type Personalization = {
+  activity: ActivityNugget[];
+  focus: string[];
+  note: string;
+  studied_messages: number;
+  reason: string;
+};
+
 export type EmailDraft = {
   id: string;
   contact_id: string;
@@ -86,6 +106,7 @@ export type EmailDraft = {
   body: string | null;
   status: string;
   sending_mailbox_id: string | null;
+  personalization: Personalization | null;
   custom_instructions: string | null;
   system_prompt: string | null;
   user_prompt: string | null;

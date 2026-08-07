@@ -6,29 +6,124 @@ from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.models.contact import ContactEmailLink
+from app.models.contact import Contact, ContactEmailLink
 from app.models.message import EmailMessage
 from app.models.outreach import EmailDraft, OutreachPrompt
 from app.services.ai_service import _call_anthropic, build_metadata_context, _contact_messages, _get_contact
 from app.services.graph_client import GraphAuthError, GraphClient
+from app.services.personal_brief import (
+    format_personal_brief,
+    format_their_own_words,
+    get_personal_brief,
+    prewarm_briefs,
+)
 from app.services.relationship_context import build_relationship_evidence, format_relationship_evidence
 from app.services.mail_sender import MailSendError, send_via_mailbox
 from app.services.mailboxes import MailboxConfigError, default_mailbox, get_mailbox
 
 DEFAULT_SYSTEM_PROMPT = (
     "You write outreach emails for Edge Investing / Galaxy Pharma.\n\n"
-    "The context you are given labels every past message with who wrote it — either WE WROTE "
-    "or THEY WROTE. Read those labels carefully. Attributing our own words to the recipient, "
-    "or theirs to us, produces an email that cannot be sent, so treat the distinction as the "
-    "most important thing in the brief.\n\n"
+    "The email must read as though the sender has been paying attention to the recipient. A "
+    "note that could have been sent to anybody is a failure even when every sentence in it is "
+    "true. The brief includes a section headed WHAT THEY HAVE BEEN DOING, listing things the "
+    "recipient has actually been up to, each one quoted from their own mail — leading with one "
+    "of those is the single most important thing you do.\n\n"
+    "That section is also a limit. Congratulate, acknowledge, or allude to nothing that is not "
+    "in it. When it says nothing was verified, it means the mail contains no news about this "
+    "person: open on the last real message instead, and never fall back on 'hope all is well "
+    "at <company>' or an invented achievement. Congratulating someone on something that did "
+    "not happen loses the relationship outright.\n\n"
+    "The context labels every past message with who wrote it — either WE WROTE or THEY WROTE. "
+    "Attributing our own words to the recipient, or theirs to us, produces an email that "
+    "cannot be sent, so treat the distinction as the most important thing on the page after "
+    "the brief itself.\n\n"
     "Never invent facts. Do not state a job title, employer, deal, mutual contact, meeting, or "
-    "commitment that is not present in the context. If you have nothing specific to reference, "
-    "write a brief and honest note rather than a padded one.\n\n"
+    "commitment that is not present in the context.\n\n"
     "Never mention email volume, thread counts, or how long it has been since you last spoke. "
     "Those are internal metrics, not things one writes to a person."
 )
 
 DEFAULT_USER_PROMPT_TEMPLATE = """Draft a short outreach email to this contact.
+
+Build the email in three beats, in this order:
+
+1. THEM. Open on something specific they have been doing, taken from WHAT THEY HAVE BEEN
+   DOING. Name the deal, company, role, or launch. If it is recent and good news, congratulate
+   them in one sentence and mean it; if it is older, refer to it as something you know about
+   rather than as news. Use their own framing where the quote gives it to you.
+   If that section says nothing was verified, open instead on the substance of the most recent
+   message THEY wrote — continue that thread rather than restarting the conversation. If they
+   have never written to us at all, say plainly why you are reaching out. Never open with a
+   generic pleasantry in either case.
+
+2. THE BRIDGE. One sentence that connects what they are doing to why you are writing now. This
+   is where the email earns the ask — the link should be real, not a pivot.
+
+3. THE ASK. The purpose of the outreach, stated once, as a low-friction next step.
+
+Rules:
+- Only reference specifics that appear in the context. Precision beats warmth.
+- Do not stack achievements. One opener, well chosen, beats three.
+- Professional and warm, but direct. No filler openings, no flattery beyond the facts.
+- Body under 160 words. Shorter is better.
+- No placeholders like [Name] or [Company] — use the real values or omit the sentence.
+- Sign off as "Best regards" with no name (the sender adds their own signature).
+
+{custom_instructions_block}
+
+Return ONLY in this format, with nothing before or after:
+Subject: <subject line>
+
+<body paragraphs>
+
+=== CONTEXT ===
+{context}"""
+
+# Stock prompts from earlier versions. A row still holding one of these has never been edited
+# by the user, so it is safe to upgrade in place; anything else is a deliberate customisation
+# and is left untouched.
+_LEGACY_SYSTEM_PROMPTS = {
+    (
+        "You write professional, warm fundraising outreach emails for Edge Investing / Galaxy Pharma. "
+        "Personalize based on prior correspondence. Never invent facts not supported by the contact data."
+    ),
+    # The stock prompt before the brief existed: correct about attribution, but it had nothing
+    # to say about what the recipient had been doing, so drafts never opened on them.
+    (
+        "You write outreach emails for Edge Investing / Galaxy Pharma.\n\n"
+        "The context you are given labels every past message with who wrote it — either WE WROTE "
+        "or THEY WROTE. Read those labels carefully. Attributing our own words to the recipient, "
+        "or theirs to us, produces an email that cannot be sent, so treat the distinction as the "
+        "most important thing in the brief.\n\n"
+        "Never invent facts. Do not state a job title, employer, deal, mutual contact, meeting, or "
+        "commitment that is not present in the context. If you have nothing specific to reference, "
+        "write a brief and honest note rather than a padded one.\n\n"
+        "Never mention email volume, thread counts, or how long it has been since you last spoke. "
+        "Those are internal metrics, not things one writes to a person."
+    ),
+}
+
+_LEGACY_USER_PROMPTS = {
+    """Draft a fundraising outreach email to this contact.
+
+Requirements:
+- Professional, warm, personalized tone
+- Reference prior correspondence naturally if any exists
+- Clear call to action (call or meeting about a funding opportunity)
+- Do not invent specific facts not supported by the data below
+- Under 200 words for the body
+- Sign off as "Best regards" without a name (the user will add their signature)
+
+{custom_instructions_block}
+
+Return ONLY in this format:
+Subject: <subject line>
+
+<body paragraphs>
+
+Contact context:
+{context}""",
+    """Draft a short outreach email to this contact.
 
 How to use the context:
 - Anchor the email on the most recent message THEY wrote, when there is one. That is the live
@@ -53,37 +148,6 @@ Subject: <subject line>
 <body paragraphs>
 
 === CONTEXT ===
-{context}"""
-
-# Stock prompts from earlier versions. A row still holding one of these has never been edited
-# by the user, so it is safe to upgrade in place; anything else is a deliberate customisation
-# and is left untouched.
-_LEGACY_SYSTEM_PROMPTS = {
-    (
-        "You write professional, warm fundraising outreach emails for Edge Investing / Galaxy Pharma. "
-        "Personalize based on prior correspondence. Never invent facts not supported by the contact data."
-    ),
-}
-
-_LEGACY_USER_PROMPTS = {
-    """Draft a fundraising outreach email to this contact.
-
-Requirements:
-- Professional, warm, personalized tone
-- Reference prior correspondence naturally if any exists
-- Clear call to action (call or meeting about a funding opportunity)
-- Do not invent specific facts not supported by the data below
-- Under 200 words for the body
-- Sign off as "Best regards" without a name (the user will add their signature)
-
-{custom_instructions_block}
-
-Return ONLY in this format:
-Subject: <subject line>
-
-<body paragraphs>
-
-Contact context:
 {context}""",
 }
 
@@ -193,16 +257,73 @@ def build_user_prompt(
     return template.replace("{custom_instructions_block}", block).replace("{context}", context)
 
 
-def build_draft_context(db: Session, contact, messages) -> str:
-    """Grounding for a draft: relationship evidence first, then the labelled message log.
+def build_draft_context(db: Session, contact, messages, brief: dict | None = None) -> str:
+    """Grounding for a draft, ordered by how much it shapes the email.
 
-    The evidence block separates the last message *from them* and the last message *from us*,
-    which is what the draft needs to continue the right conversation.
+    The brief goes first because it decides the opening line, which is the part of the email
+    that determines whether it reads as written to this person or to a list. Relationship
+    evidence follows — it separates the last message *from them* from the last *from us*, so
+    the draft continues the right conversation — then their own recent messages in full, then
+    the labelled log of both sides.
+
+    ``brief`` is optional so the older callers that only have a contact and a message list keep
+    working; without it the context is exactly what it was before, minus the opening angle.
     """
-    sections = [format_relationship_evidence(build_relationship_evidence(db, contact))]
+    sections: list[str] = []
+    if brief is not None:
+        sections.append(format_personal_brief(brief))
+    sections.append(format_relationship_evidence(build_relationship_evidence(db, contact)))
+    own_words = format_their_own_words(brief)
+    if own_words:
+        sections.append(own_words)
     if messages:
         sections.append(build_metadata_context(contact, messages))
     return "\n\n".join(sections)
+
+
+def _contacts_for(db: Session, contact_ids: list[str]) -> list:
+    """Approved contacts from a batch, with their AI context loaded.
+
+    Unapproved ids are dropped rather than reported: ``generate_draft_for_contact`` raises the
+    real error for them a moment later, and studying someone who is about to be rejected is
+    wasted work.
+    """
+    if not contact_ids:
+        return []
+    return (
+        db.query(Contact)
+        .options(joinedload(Contact.context))
+        .filter(Contact.id.in_(contact_ids), Contact.review_status == "approved")
+        .all()
+    )
+
+
+def summarize_personalization(brief: dict | None) -> dict:
+    """What the sender is shown about why the email opens the way it does.
+
+    Deliberately excludes ``their_words``: the card needs the evidence for the opening line,
+    not a copy of the recipient's inbox. Each item keeps its quote and date so a claim in the
+    email can be checked against the mail it came from without leaving the review screen.
+    """
+    brief = brief or {}
+    return {
+        "activity": [
+            {
+                "headline": item.get("headline"),
+                "detail": item.get("detail"),
+                "quote": item.get("quote"),
+                "date": item.get("source_date"),
+                "said_by": item.get("said_by"),
+                "is_recent": item.get("is_recent", False),
+                "source_subject": item.get("source_subject"),
+            }
+            for item in (brief.get("activity") or [])
+        ],
+        "focus": brief.get("focus") or [],
+        "note": brief.get("note") or "",
+        "studied_messages": brief.get("studied_messages", 0),
+        "reason": brief.get("reason") or "",
+    }
 
 
 async def generate_draft_for_contact(
@@ -212,6 +333,7 @@ async def generate_draft_for_contact(
     custom_instructions: str | None = None,
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
+    restudy: bool = False,
 ) -> EmailDraft:
     contact = _get_contact(db, contact_id)
     if contact.review_status != "approved":
@@ -219,7 +341,10 @@ async def generate_draft_for_contact(
 
     prompt_row = get_or_create_prompt(db)
     messages = _contact_messages(db, contact_id)
-    context = build_draft_context(db, contact, messages)
+    # Read what this person has been doing before writing to them. Cached per contact and
+    # refreshed when they write again, so a bulk run studies each person once.
+    brief = await get_personal_brief(db, contact, force=restudy)
+    context = build_draft_context(db, contact, messages, brief)
 
     instructions = custom_instructions
     if objective and objective.strip():
@@ -244,6 +369,7 @@ async def generate_draft_for_contact(
     draft.custom_instructions = instructions
     draft.system_prompt = prompt_row.system_prompt
     draft.user_prompt = user_prompt
+    draft.personalization = summarize_personalization(brief)
     draft.error_message = None
     draft.updated_at = datetime.utcnow()
 
@@ -266,7 +392,13 @@ async def generate_drafts_bulk(
     custom_instructions: str | None = None,
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
+    restudy: bool = False,
 ) -> list[dict]:
+    # Study everyone first, together. Writing the emails one after another is fine — it is fast
+    # and each one needs the previous commit — but making each contact wait for the previous
+    # contact's mailbox reads and study call is what made a batch of twenty feel broken.
+    await prewarm_briefs(db, _contacts_for(db, contact_ids), force=restudy)
+
     results: list[dict] = []
     for contact_id in contact_ids:
         try:
@@ -276,6 +408,9 @@ async def generate_drafts_bulk(
                 custom_instructions=custom_instructions,
                 objective=objective,
                 mailbox_ids=mailbox_ids,
+                # The prewarm above already honoured ``restudy``. Passing it on would study
+                # every contact a second time, at full cost, for an identical answer.
+                restudy=False,
             )
             results.append({"contact_id": contact_id, "draft_id": draft.id, "status": "ok"})
         except Exception as exc:
@@ -306,6 +441,7 @@ def draft_to_dict(draft: EmailDraft) -> dict:
         "body": draft.body,
         "status": draft.status,
         "sending_mailbox_id": draft.sending_mailbox_id,
+        "personalization": draft.personalization,
         "custom_instructions": draft.custom_instructions,
         "system_prompt": draft.system_prompt,
         "user_prompt": draft.user_prompt,

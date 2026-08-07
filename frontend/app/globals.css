@@ -973,6 +973,99 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- what the draft was personalised on --- */
+.draft-brief {
+  margin: 4px 0 12px 88px;
+  padding: 10px 12px;
+  border: 1px solid #d6e4ff;
+  border-left: 3px solid #4f75d1;
+  border-radius: 8px;
+  background: #f6f9ff;
+}
+
+.draft-brief.empty {
+  border-color: #e7e9ee;
+  border-left-color: #c3c8d2;
+  background: #fafbfc;
+  display: grid;
+  gap: 2px;
+}
+
+.draft-brief-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.draft-brief-title {
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #3f5fa8;
+}
+
+.draft-brief.empty .draft-brief-title {
+  color: #6b7280;
+}
+
+.draft-brief-count {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: #4f75d1;
+  color: white;
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.draft-brief-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.draft-brief-headline {
+  display: block;
+  font-size: 0.85rem;
+  color: #1f2a44;
+  font-weight: 600;
+}
+
+.draft-brief-quote {
+  margin: 5px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid #c7d7f5;
+  font-size: 0.8rem;
+  color: #435068;
+  font-style: italic;
+}
+
+.draft-brief-quote cite {
+  display: block;
+  margin-top: 3px;
+  font-style: normal;
+  font-size: 0.72rem;
+  color: #8a93a5;
+}
+
+.draft-brief-focus,
+.draft-brief-note {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e2eaf8;
+}
+
 .draft-card-foot {
   display: flex;
   justify-content: space-between;
@@ -997,6 +1090,9 @@ th .info-tip-popover::before {
     grid-template-columns: 1fr;
   }
   .draft-lines {
+    margin-left: 0;
+  }
+  .draft-brief {
     margin-left: 0;
   }
 }

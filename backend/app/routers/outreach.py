@@ -43,6 +43,8 @@ class GenerateDraftsRequest(BaseModel):
 class SingleGenerateRequest(BaseModel):
     custom_instructions: str | None = None
     objective: str | None = None
+    # Re-read the contact's mail instead of reusing the cached study of what they are doing.
+    restudy: bool = False
 
 
 class DraftUpdate(BaseModel):
@@ -160,7 +162,11 @@ async def post_generate_for_contact(
     objective = payload.objective if payload else None
     try:
         draft = await generate_draft_for_contact(
-            db, contact_id, custom_instructions=instructions, objective=objective
+            db,
+            contact_id,
+            custom_instructions=instructions,
+            objective=objective,
+            restudy=payload.restudy if payload else False,
         )
         return draft_to_dict(draft)
     except OutreachError as exc:

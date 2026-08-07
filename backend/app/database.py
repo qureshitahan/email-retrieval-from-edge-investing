@@ -160,12 +160,16 @@ def run_migrations() -> None:
         with engine.begin() as conn:
             if "ai_relationship_context" not in ctx_columns:
                 conn.execute(text("ALTER TABLE contact_context ADD COLUMN ai_relationship_context TEXT"))
+            if "ai_personal_brief" not in ctx_columns:
+                conn.execute(text("ALTER TABLE contact_context ADD COLUMN ai_personal_brief JSON"))
 
     if "email_drafts" in inspector.get_table_names():
         draft_columns = {column["name"] for column in inspector.get_columns("email_drafts")}
         with engine.begin() as conn:
             if "sending_mailbox_id" not in draft_columns:
                 conn.execute(text("ALTER TABLE email_drafts ADD COLUMN sending_mailbox_id VARCHAR(64)"))
+            if "personalization" not in draft_columns:
+                conn.execute(text("ALTER TABLE email_drafts ADD COLUMN personalization JSON"))
 
     if "contacts" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("contacts")}
