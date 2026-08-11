@@ -45,6 +45,21 @@ MAX_SCAN = 600
 SUBJECT_SAMPLES = 4
 BRIEF_EXCERPT_CHARS = 200
 
+
+def own_addresses() -> set[str]:
+    """Every address the user sends from, lower-cased.
+
+    Read from the configured mailboxes rather than a hard-coded list, so adding a fourth
+    mailbox does not silently reintroduce the "drafted an email to myself" case. A mailbox
+    configuration error is not worth failing a search over — the filter just does less.
+    """
+    try:
+        from app.services.mailboxes import load_mailboxes
+
+        return {mailbox.from_email.strip().lower() for mailbox in load_mailboxes() if mailbox.from_email}
+    except Exception:  # noqa: BLE001
+        return set()
+
 SYSTEM_PROMPT = """You rank business contacts against a specific objective.
 
 You are given an objective and a numbered list of contacts, each with factual evidence drawn
@@ -169,6 +184,12 @@ def shortlist_candidates(
         Contact.email_count > 0,
     )
 
+    # The sender's own addresses turn up as contacts because they appear on their own mail.
+    # A shortlist that offers to draft an outreach email to yourself is never right.
+    own = own_addresses()
+    if own:
+        query = query.filter(func.lower(Contact.primary_email).notin_(own))
+
     if mailbox_ids:
         from_selected = (
             db.query(ContactEmailLink.id)
@@ -291,6 +312,8 @@ async def prioritize_contacts(
         return_exceptions=True,
     )
 
+    brief_by_contact = {contact.id: briefs[i] for i, contact in enumerate(candidates)}
+
     items: list[dict] = []
     failed_batches = 0
     for (chunk, _), rankings in zip(batches, scored_batches):
@@ -313,6 +336,10 @@ async def prioritize_contacts(
                     # instead of implying the contact was judged irrelevant.
                     "objective_score": ranked["score"] if ranked else None,
                     "reason": ranked["reason"] if ranked else None,
+                    # Exactly what the model was shown about this person. Returned so the
+                    # shortlist can prove why someone made it, rather than asking the reader to
+                    # trust a score: a wrong pick is only obvious next to its evidence.
+                    "evidence": brief_by_contact.get(contact.id),
                 }
             )
 

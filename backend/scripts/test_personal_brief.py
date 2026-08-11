@@ -213,11 +213,35 @@ print()
 print("=== the empty case is explicit, not silent ===")
 
 blank = format_personal_brief(empty_brief("not enough correspondence to study"))
-ok("states that nothing was verified", "Nothing verified" in blank)
-ok("forbids congratulating", "Do NOT congratulate" in blank)
+ok("says there is no news to congratulate them on", "No news or achievement" in blank)
+ok("forbids inventing one", "Do NOT invent one" in blank)
 ok("names the generic opener it must not use", "hope things are going well" in blank)
+ok("says nothing at all was verifiable", "Nothing at all was verifiable" in blank)
+ok("points at the fallback opener", "last real message" in blank)
 ok("a None brief still produces a safe block", "Nothing verified" in format_personal_brief(None))
 ok("a junk brief still produces a safe block", "Nothing verified" in format_personal_brief("garbage"))
+
+# The whole point of the widening: a contact with no *news* but with something else on record
+# must still give the draft a real opener rather than falling through to the empty case.
+no_news_but_known = format_personal_brief(
+    {
+        "activity": [],
+        "about_them": [
+            {
+                "headline": "offered to introduce us to his US partners",
+                "detail": "Said he could connect us with his partners in the USA.",
+                "quote": "You mentioned you could introduce me to your partners in USA.",
+                "said_by": "them",
+                "source_date": "2026-05-04",
+                "is_recent": True,
+            }
+        ],
+    }
+)
+ok("a contact with no news still gets an opener", "offered to introduce us" in no_news_but_known)
+ok("the second section is labelled for that use", "WHAT ELSE WE KNOW ABOUT THEM" in no_news_but_known)
+ok("and it is not reported as nothing known",
+   "Nothing at all was verifiable" not in no_news_but_known)
 
 print()
 print("=== rendering ===")

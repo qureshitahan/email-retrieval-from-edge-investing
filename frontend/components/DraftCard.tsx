@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { EmailDraft, MailboxStatus, Personalization } from "@/lib/api";
+import { ActivityNugget, EmailDraft, MailboxStatus, Personalization } from "@/lib/api";
 
 /**
  * What the draft was personalised on.
@@ -12,18 +12,49 @@ import { EmailDraft, MailboxStatus, Personalization } from "@/lib/api";
  * a deal, the quote that claim came from is one click away. When nothing was verified it says
  * so plainly — an email that opens on the last message is a correct outcome, not a failure.
  */
+function BriefItems({ items, open }: { items: ActivityNugget[]; open: boolean }) {
+  return (
+    <ul className="draft-brief-list">
+      {items.map((item, i) => (
+        <li key={i}>
+          <span className="draft-brief-headline">{item.headline}</span>
+          <span className="meta">
+            {item.date || "date unknown"}
+            {item.said_by === "us" ? " · you said this to them" : " · they told you"}
+            {item.is_recent ? "" : " · over a year ago"}
+          </span>
+          {open && item.quote && (
+            <blockquote className="draft-brief-quote">
+              &ldquo;{item.quote}&rdquo;
+              {item.source_subject && <cite> — {item.source_subject}</cite>}
+            </blockquote>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function PersonalizationPanel({ data }: { data: Personalization }) {
   const [open, setOpen] = useState(false);
   const activity = data.activity || [];
+  const aboutThem = data.about_them || [];
   const focus = data.focus || [];
+  const total = activity.length + aboutThem.length;
+  const readNote = data.studied_messages
+    ? `read ${data.studied_messages} message${data.studied_messages === 1 ? "" : "s"}` +
+      (data.full_bodies_read ? `, ${data.full_bodies_read} in full` : "")
+    : "";
 
-  if (activity.length === 0 && focus.length === 0) {
+  // Only when the mail genuinely establishes nothing about this person. Made rare on purpose:
+  // an offer they made or a problem they described is just as personal as an achievement.
+  if (total === 0 && focus.length === 0) {
     return (
       <div className="draft-brief empty">
-        <span className="draft-brief-title">Nothing recent found about them</span>
+        <span className="draft-brief-title">Nothing quotable about them</span>
         <span className="meta">
-          {data.reason || "no concrete activity in the mail"} — opened on your last exchange
-          instead{data.studied_messages ? ` (read ${data.studied_messages} messages)` : ""}.
+          {data.reason || "nothing in the mail could be quoted"} — opened on your last exchange
+          instead{readNote ? ` (${readNote})` : ""}.
         </span>
       </div>
     );
@@ -34,31 +65,21 @@ function PersonalizationPanel({ data }: { data: Personalization }) {
       <button className="draft-brief-head" onClick={() => setOpen(!open)} type="button">
         <span className="draft-brief-title">
           What we know they&apos;re doing
-          {activity.length > 0 && <span className="draft-brief-count">{activity.length}</span>}
+          {total > 0 && <span className="draft-brief-count">{total}</span>}
         </span>
         <span className="meta">{open ? "hide" : "show evidence"}</span>
       </button>
 
-      <ul className="draft-brief-list">
-        {activity.map((item, i) => (
-          <li key={i}>
-            <span className="draft-brief-headline">{item.headline}</span>
-            <span className="meta">
-              {item.date || "date unknown"}
-              {item.said_by === "us" ? " · you said this to them" : " · they told you"}
-              {item.is_recent ? "" : " · over a year ago"}
-            </span>
-            {open && item.quote && (
-              <blockquote className="draft-brief-quote">
-                &ldquo;{item.quote}&rdquo;
-                {item.source_subject && (
-                  <cite> — {item.source_subject}</cite>
-                )}
-              </blockquote>
-            )}
-          </li>
-        ))}
-      </ul>
+      {activity.length > 0 && <BriefItems items={activity} open={open} />}
+
+      {aboutThem.length > 0 && (
+        <>
+          {activity.length > 0 && (
+            <span className="draft-brief-sub">Also on record</span>
+          )}
+          <BriefItems items={aboutThem} open={open} />
+        </>
+      )}
 
       {open && focus.length > 0 && (
         <div className="draft-brief-focus">
@@ -66,6 +87,7 @@ function PersonalizationPanel({ data }: { data: Personalization }) {
         </div>
       )}
       {open && data.note && <div className="meta draft-brief-note">{data.note}</div>}
+      {open && readNote && <div className="meta draft-brief-note">Studied: {readNote}.</div>}
     </div>
   );
 }

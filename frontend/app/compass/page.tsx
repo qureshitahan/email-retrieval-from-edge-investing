@@ -33,6 +33,7 @@ export default function CompassPage() {
 
   const [ranked, setRanked] = useState<RankedContact[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
   const [summary, setSummary] = useState<string | null>(null);
 
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
@@ -101,6 +102,15 @@ export default function CompassPage() {
 
   function toggleMailbox(id: string) {
     setIncluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleEvidence(id: string) {
+    setOpenEvidence((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -631,26 +641,44 @@ export default function CompassPage() {
 
           <div className="ranked-list">
             {ranked.map((r, i) => (
-              <label
+              <div
                 key={r.contact_id}
                 className={`ranked-item${selected.has(r.contact_id) ? " selected" : ""}`}
               >
-                <input
-                  type="checkbox"
-                  checked={selected.has(r.contact_id)}
-                  onChange={() => toggleContact(r.contact_id)}
-                />
-                <span className="rank">{i + 1}</span>
-                <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
-                  {r.objective_score === null ? "—" : r.objective_score}
-                </span>
-                <span className="who">
-                  <strong>{r.full_name || r.primary_email}</strong>
-                  {r.company_name ? ` · ${r.company_name}` : ""}
-                  {r.review_status === "approved" && <em className="approved-tag"> approved</em>}
-                  <span className="why">{r.reason || "No score returned for this contact."}</span>
-                </span>
-              </label>
+                <label className="ranked-main">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(r.contact_id)}
+                    onChange={() => toggleContact(r.contact_id)}
+                  />
+                  <span className="rank">{i + 1}</span>
+                  <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
+                    {r.objective_score === null ? "—" : r.objective_score}
+                  </span>
+                  <span className="who">
+                    <strong>{r.full_name || r.primary_email}</strong>
+                    {r.company_name ? ` · ${r.company_name}` : ""}
+                    {r.review_status === "approved" && <em className="approved-tag"> approved</em>}
+                    <span className="why">{r.reason || "No score returned for this contact."}</span>
+                  </span>
+                </label>
+                {r.evidence && (
+                  <div className="ranked-evidence">
+                    <button
+                      type="button"
+                      className="link-btn"
+                      onClick={() => toggleEvidence(r.contact_id)}
+                    >
+                      {openEvidence.has(r.contact_id) ? "Hide evidence" : "Show evidence"}
+                    </button>
+                    {openEvidence.has(r.contact_id) && (
+                      /* Exactly what the ranker was shown. A wrong pick is only obvious next
+                         to the evidence it was picked on. */
+                      <pre className="evidence-block">{r.evidence}</pre>
+                    )}
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>

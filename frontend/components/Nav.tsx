@@ -7,6 +7,7 @@ export function Nav() {
       <Link href="/compass">Compass</Link>
       <Link href="/">Contacts</Link>
       <Link href="/outreach">Outreach</Link>
+      <Link href="/senders">Your profile</Link>
     </nav>
   );
 }

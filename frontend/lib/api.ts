@@ -89,10 +89,14 @@ export type ActivityNugget = {
 
 /** The evidence behind a draft's opening line, shown before it is sent. */
 export type Personalization = {
+  /** News worth congratulating them on. Often empty, and that is fine. */
   activity: ActivityNugget[];
+  /** Everything else the mail establishes: what they offered, asked, are working on. */
+  about_them: ActivityNugget[];
   focus: string[];
   note: string;
   studied_messages: number;
+  full_bodies_read: number;
   reason: string;
 };
 
@@ -114,6 +118,52 @@ export type EmailDraft = {
   sent_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/** One claim the sender can make, quoted from a document they uploaded. */
+export type ProofPoint = {
+  text: string;
+  quote?: string;
+  source?: string;
+  pinned?: boolean;
+};
+
+export type SenderDocument = {
+  id: string;
+  mailbox_id: string;
+  filename: string;
+  kind: string;
+  char_count: number;
+  proof_point_count: number;
+  proof_points: ProofPoint[];
+  keywords: string[];
+  summary: string | null;
+  status: "ready" | "text_only" | "failed";
+  error_message: string | null;
+  uploaded_at: string;
+};
+
+/** The sender's own story for one mailbox — what the pitch half of a draft is built from. */
+export type SenderProfile = {
+  mailbox_id: string;
+  label?: string;
+  from_email?: string;
+  from_name?: string | null;
+  display_name: string | null;
+  title: string | null;
+  company: string | null;
+  positioning: string | null;
+  linkedin_url: string | null;
+  phone: string | null;
+  website: string | null;
+  signature: string | null;
+  proof_points: ProofPoint[];
+  keywords: string[];
+  documents?: SenderDocument[];
+  document_count?: number;
+  effective_signature?: string;
+  is_configured: boolean;
+  updated_at: string | null;
 };
 
 /** One person's place in a drafting run — written, in hand, or still queued. */
@@ -192,6 +242,8 @@ export type RankedContact = {
   baseline_score: number;
   objective_score: number | null;
   reason: string | null;
+  /** Exactly what the ranker was shown about this person, so a pick can be checked. */
+  evidence: string | null;
 };
 
 /** A mailbox plus live readiness — `connected` means usable with no user action. */
@@ -392,6 +444,55 @@ export const api = {
         mailbox_ids: mailboxIds,
       }),
     }),
+  senders: () =>
+    apiFetch<{ items: SenderProfile[]; supported_extensions: string[] }>("/senders"),
+  sender: (mailboxId: string) =>
+    apiFetch<SenderProfile & { supported_extensions: string[] }>(
+      `/senders/${encodeURIComponent(mailboxId)}`
+    ),
+  updateSender: (mailboxId: string, patch: Partial<SenderProfile>) =>
+    apiFetch<SenderProfile>(`/senders/${encodeURIComponent(mailboxId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  /**
+   * Upload a résumé, bio or deal sheet.
+   *
+   * Deliberately not routed through `apiFetch`: that sets a JSON content type, and a multipart
+   * body needs the browser to set its own boundary header.
+   */
+  uploadSenderDocument: async (mailboxId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${API_BASE}/senders/${encodeURIComponent(mailboxId)}/documents`, {
+      method: "POST",
+      body: form,
+      cache: "no-store",
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      try {
+        throw new Error(JSON.parse(text).detail || text || res.statusText);
+      } catch (err) {
+        throw err instanceof Error ? err : new Error(text || res.statusText);
+      }
+    }
+    return JSON.parse(text) as {
+      document: SenderDocument;
+      profile: SenderProfile;
+      truncated: boolean;
+    };
+  },
+  deleteSenderDocument: (mailboxId: string, documentId: string) =>
+    apiFetch<{ deleted: string; profile: SenderProfile }>(
+      `/senders/${encodeURIComponent(mailboxId)}/documents/${documentId}`,
+      { method: "DELETE" }
+    ),
+  reindexSender: (mailboxId: string) =>
+    apiFetch<{ reindexed: number; profile: SenderProfile }>(
+      `/senders/${encodeURIComponent(mailboxId)}/reindex`,
+      { method: "POST" }
+    ),
   draftRun: (runId: string) => apiFetch<DraftRun>(`/outreach/drafts/runs/${runId}`),
   latestDraftRun: () => apiFetch<DraftRun | null>("/outreach/drafts/runs/latest"),
   generateDraftForContact: (contactId: string, customInstructions?: string, objective?: string) =>

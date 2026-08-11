@@ -32,9 +32,13 @@ from app.services.text_utils import strip_quoted_reply
 # How much correspondence the study pass reads. Their own words carry nearly all the signal
 # about what they are doing, so most of the budget is reserved for inbound messages; ours are
 # included because a reply of ours often names the thing they told us about.
-STUDY_MESSAGE_LIMIT = 14
-THEIR_MESSAGE_QUOTA = 9
-FULL_BODY_FETCH_LIMIT = 8
+# The draft is only as good as the conversation behind it, so the study reads the whole recent
+# exchange rather than a sample of it: at least ten full message bodies where that many exist,
+# both sides, newest first. Their own words carry most of the signal about what they are doing,
+# so most of the budget is reserved for inbound messages.
+STUDY_MESSAGE_LIMIT = 18
+THEIR_MESSAGE_QUOTA = 11
+FULL_BODY_FETCH_LIMIT = 12
 BODY_CHARS = 2200
 PREVIEW_CHARS = 700
 
@@ -151,10 +155,12 @@ async def gather_study_material(db: Session, contact_id: str) -> list[dict]:
     material: list[dict] = []
     for index, message in enumerate(messages):
         text = ""
+        full_body = False
         if index < len(fetched):
             raw = fetched[index]
             if isinstance(raw, str) and raw:
                 text = strip_quoted_reply(raw)[:BODY_CHARS]
+                full_body = bool(text.strip())
         if not text:
             text = strip_quoted_reply(message.body_preview)[:PREVIEW_CHARS]
         if not text.strip():
@@ -167,6 +173,9 @@ async def gather_study_material(db: Session, contact_id: str) -> list[dict]:
                 "subject": message.subject or "(no subject)",
                 "sent_at": message.sent_datetime,
                 "text": text.strip(),
+                # Whether this is the whole message or only the stored preview, so the reviewer
+                # can tell how deeply the conversation was actually read.
+                "full_body": full_body,
             }
         )
     return material
@@ -185,10 +194,12 @@ def _material_block(material: list[dict]) -> str:
 
 STUDY_SYSTEM_PROMPT = (
     "You are a research analyst. You read one person's correspondence and report, strictly "
-    "factually, what that person has been doing lately.\n\n"
-    "Your output is used to congratulate them by name on real events, so a fabricated or "
-    "embellished achievement is the worst possible failure. It is always better to return an "
-    "empty list than a plausible guess.\n\n"
+    "factually, everything known about them that is worth referencing when writing to them.\n\n"
+    "Your output is quoted back to that person by name, so a fabricated or embellished claim is "
+    "the worst possible failure. Never guess. But also never come back empty-handed when the "
+    "correspondence plainly says something about them: a stated role, a request they made, an "
+    "offer they extended, a problem they are working on and an outstanding commitment are all "
+    "real, referenceable facts even though none of them is an achievement.\n\n"
     "Absolute rules:\n"
     "- Every item must be supported by a quote copied character-for-character from the "
     "material. Do not paraphrase inside the quote, do not fix its spelling, do not join two "
@@ -196,14 +207,16 @@ STUDY_SYSTEM_PROMPT = (
     "- Report only what the text states. Do not infer a promotion from a changed signature, a "
     "closed deal from an attachment name, or a launch from an invitation.\n"
     "- The material labels each message THEY WROTE or WE WROTE. Never report something we did "
-    "as something they did.\n"
+    "as something they did. An offer we made to them is not something they offered us.\n"
     "- Marketing blasts, newsletters, calendar invites and automated notifications describe an "
     "organisation, not this person. Ignore them.\n"
     "- Return JSON only. No prose, no markdown fence."
 )
 
-STUDY_USER_TEMPLATE = """Study {name}{company_clause} from the correspondence below and report what
-they have been doing.
+STUDY_USER_TEMPLATE = """Study {name}{company_clause} from the correspondence below.
+
+You are producing the briefing someone reads immediately before writing to this person, so it
+must answer two questions: what have they been doing, and what do we know about them.
 
 Return exactly this JSON shape:
 
@@ -212,7 +225,17 @@ Return exactly this JSON shape:
     {{
       "headline": "short phrase naming the thing they did, e.g. \\"closed the Aurora acquisition\\"",
       "detail": "one sentence of specifics - who, what, which company or deal",
-      "kind": "deal|funding|role|launch|award|hiring|expansion|event|milestone|personal|other",
+      "kind": "deal|funding|role_change|launch|award|hiring|expansion|event|milestone|personal|other",
+      "ref": "the [m#] marker of the message this came from",
+      "quote": "verbatim sentence from that message that proves it",
+      "who_said_it": "them|us"
+    }}
+  ],
+  "about_them": [
+    {{
+      "headline": "short phrase, e.g. \\"offered to introduce us to his US partners\\"",
+      "detail": "one sentence of specifics",
+      "kind": "role|working_on|asked_us_for|offered_us|commitment|met_them|interest|constraint|other",
       "ref": "the [m#] marker of the message this came from",
       "quote": "verbatim sentence from that message that proves it",
       "who_said_it": "them|us"
@@ -222,12 +245,24 @@ Return exactly this JSON shape:
   "note": "one sentence on anything that changes how you would approach them, or \\"\\""
 }}
 
-Rules for "activity":
-- At most {max_items} items, most recent and most notable first.
-- Only concrete events with a subject and an outcome. "Discussed the market" is not activity;
+"activity" is for things that HAPPENED and could be congratulated or acknowledged as news:
+- Concrete events with a subject and an outcome. "Discussed the market" is not activity;
   "closed the Series B for Nexa Bio" is.
-- Prefer things THEY said about themselves over things we said about them.
-- Omit anything you cannot quote. An empty list is a valid and useful answer.
+- Most recent and most notable first, at most {max_items}.
+- Leave it empty if the correspondence contains no such event. That is normal and expected.
+
+"about_them" is for everything else the mail establishes about this person, and it should
+almost never be empty when there is real correspondence. Include:
+- their role, remit or company, where stated
+- what they are working on or trying to solve
+- anything they ASKED US for, and anything they OFFERED us - an introduction, a referral, a
+  meeting, a document
+- commitments either side made that are still open
+- where and when we met them
+- stated interests, preferences or constraints
+At most {max_items} items, most useful for writing to them first.
+
+Both lists follow the same rule: omit anything you cannot quote.
 
 === CORRESPONDENCE ===
 {material}"""
@@ -341,10 +376,12 @@ def _their_words(material: list[dict]) -> list[dict]:
 def empty_brief(reason: str) -> dict:
     return {
         "activity": [],
+        "about_them": [],
         "focus": [],
         "note": "",
         "reason": reason,
         "studied_messages": 0,
+        "full_bodies_read": 0,
         "their_words": [],
         "generated_at": datetime.utcnow().isoformat(),
     }
@@ -382,13 +419,30 @@ async def extract_brief(contact: Contact, material: list[dict]) -> dict:
 
     proposed = payload.get("activity")
     activity = _verify_activity(proposed, material)
-    dropped = len(proposed) - len(activity) if isinstance(proposed, list) else 0
+
+    # Verified separately, then de-duplicated against the activity list: the model routinely
+    # reports the same fact in both, and seeing it twice on the card reads as a bug.
+    proposed_about = payload.get("about_them")
+    already = {_normalize(item["headline"]) for item in activity}
+    about_them = [
+        item
+        for item in _verify_activity(proposed_about, material)
+        if _normalize(item["headline"]) not in already
+    ]
+
+    dropped = 0
+    for candidate, kept in ((proposed, activity), (proposed_about, about_them)):
+        if isinstance(candidate, list):
+            dropped += max(0, len(candidate) - len(kept))
+
     return {
         "activity": activity,
+        "about_them": about_them,
         "focus": _clean_focus(payload.get("focus")),
         "note": str(payload.get("note") or "").strip()[:400],
-        "reason": "" if activity else "nothing concrete enough to reference",
+        "reason": "" if (activity or about_them) else "nothing quotable in this correspondence",
         "studied_messages": len(material),
+        "full_bodies_read": sum(1 for item in material if item.get("full_body")),
         "their_words": words,
         # Surfaced so a contact whose every proposed fact failed verification is visible as a
         # model problem rather than looking like a contact with nothing going on.
@@ -510,25 +564,42 @@ def format_personal_brief(brief: dict | None) -> str:
     if not brief or not isinstance(brief, dict):
         return "WHAT THEY HAVE BEEN DOING\n  Nothing verified — do not congratulate them on anything."
 
-    activity = brief.get("activity") or []
-    lines = ["WHAT THEY HAVE BEEN DOING (each line is quoted from the mail — safe to reference)"]
-
-    if not activity:
-        reason = brief.get("reason") or "nothing concrete enough to reference"
-        lines.append(f"  Nothing verified ({reason}).")
-        lines.append(
-            "  Do NOT congratulate them, do NOT guess at their news, and do NOT write "
-            "'hope things are going well at <company>'. Open on the last real message instead."
-        )
-    else:
-        for item in activity:
+    def render(items: list[dict]) -> list[str]:
+        out: list[str] = []
+        for item in items:
             when = item.get("source_date") or "date unknown"
             who = "they told us" if item.get("said_by") == "them" else "we said this to them"
             age = "" if item.get("is_recent") else "  [OLDER THAN A YEAR - refer to it as past, not news]"
-            lines.append(f"  - {item['headline']} ({when}, {who}){age}")
+            out.append(f"  - {item['headline']} ({when}, {who}){age}")
             if item.get("detail"):
-                lines.append(f"      {item['detail']}")
-            lines.append(f"      Exact words: \"{item['quote']}\"")
+                out.append(f"      {item['detail']}")
+            out.append(f"      Exact words: \"{item['quote']}\"")
+        return out
+
+    activity = brief.get("activity") or []
+    about_them = brief.get("about_them") or []
+    lines = ["WHAT THEY HAVE BEEN DOING (each line is quoted from the mail — safe to reference)"]
+
+    if activity:
+        lines += render(activity)
+    else:
+        lines.append(
+            "  No news or achievement to congratulate them on. Do NOT invent one and do NOT "
+            "write 'hope things are going well at <company>'."
+        )
+
+    if about_them:
+        lines += [
+            "",
+            "WHAT ELSE WE KNOW ABOUT THEM (also quoted — open on one of these if there is no news)",
+        ]
+        lines += render(about_them)
+    elif not activity:
+        reason = brief.get("reason") or "nothing quotable in this correspondence"
+        lines.append(
+            f"  Nothing at all was verifiable about this person ({reason}). Open on the "
+            "substance of the last real message instead."
+        )
 
     focus = brief.get("focus") or []
     if focus:
