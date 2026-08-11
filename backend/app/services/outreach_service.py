@@ -648,6 +648,7 @@ async def generate_draft_for_contact(
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
     restudy: bool = False,
+    selection: dict | None = None,
 ) -> EmailDraft:
     contact = _get_contact(db, contact_id)
     if contact.review_status != "approved":
@@ -736,7 +737,14 @@ async def generate_draft_for_contact(
     draft.custom_instructions = instructions
     draft.system_prompt = prompt_row.system_prompt
     draft.user_prompt = user_prompt
-    draft.personalization = summarize_personalization(brief)
+    draft.personalization = {
+        **summarize_personalization(brief),
+        # Why this person was chosen and for what. Stored on the draft rather than held in the
+        # page, so the review card still explains itself after a reload.
+        "objective": (objective or "").strip(),
+        "selection_reason": (selection or {}).get("reason") or "",
+        "selection_score": (selection or {}).get("score"),
+    }
     draft.updated_at = datetime.utcnow()
 
     # Route the reply back through the mailbox that already holds this relationship, so a
@@ -759,6 +767,7 @@ async def generate_drafts_bulk(
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
     restudy: bool = False,
+    selections: dict[str, dict] | None = None,
 ) -> list[dict]:
     # Study everyone first, together. Writing the emails one after another is fine — it is fast
     # and each one needs the previous commit — but making each contact wait for the previous
@@ -777,6 +786,7 @@ async def generate_drafts_bulk(
                 # The prewarm above already honoured ``restudy``. Passing it on would study
                 # every contact a second time, at full cost, for an identical answer.
                 restudy=False,
+                selection=(selections or {}).get(contact_id),
             )
             results.append({"contact_id": contact_id, "draft_id": draft.id, "status": "ok"})
         except Exception as exc:
@@ -915,6 +925,7 @@ def create_draft_run(
     custom_instructions: str | None = None,
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
+    selections: dict[str, dict] | None = None,
 ) -> DraftRun:
     """Queue a bulk drafting job. Raises if one is already running.
 
@@ -936,6 +947,7 @@ def create_draft_run(
         mailbox_ids=list(mailbox_ids or []),
         objective=objective,
         custom_instructions=custom_instructions,
+        selections=selections or {},
         draft_ids=[],
         errors=[],
     )
@@ -988,6 +1000,7 @@ async def run_draft_job(db_factory, run_id: str) -> None:
                         custom_instructions=run.custom_instructions,
                         objective=run.objective,
                         mailbox_ids=run.mailbox_ids or None,
+                        selection=(run.selections or {}).get(contact_id),
                     )
                     draft_ids.append(draft.id)
                     run.completed += 1

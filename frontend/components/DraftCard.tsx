@@ -119,6 +119,7 @@ export function DraftCard({
   onRegenerate,
   onDelete,
   busy,
+  signature,
 }: {
   draft: EmailDraft;
   index: number;
@@ -132,11 +133,16 @@ export function DraftCard({
   onRegenerate: () => void;
   onDelete: () => void;
   busy: boolean;
+  /** The block appended to this draft, so the line count measures only the written message. */
+  signature?: string;
 }) {
   const sendable = mailboxes.filter((m) => m.can_send);
   const from = draft.sending_mailbox_id || "";
   const fromMailbox = mailboxes.find((m) => m.id === from) || null;
-  const bodyLines = (draft.body || "").split("\n").filter((l) => l.trim()).length;
+  // Only the written message counts. The signature is appended afterwards and is four or five
+  // lines on its own, which made every correctly-sized email report "8 lines (aim for 4–5)".
+  const written = signature ? (draft.body || "").replace(signature, "") : draft.body || "";
+  const bodyLines = written.split("\n").filter((l) => l.trim()).length;
   const isSent = draft.status === "sent";
   // A draft that did not generate correctly is kept visible so it can be regenerated, but it
   // must never look ready: no ticking it, no sending it.
@@ -185,6 +191,30 @@ export function DraftCard({
       </div>
 
       {draft.personalization && <PersonalizationPanel data={draft.personalization} />}
+
+      {(draft.personalization?.selection_reason || draft.personalization?.objective) && (
+        <div className="draft-why">
+          {draft.personalization.objective && (
+            <div className="draft-why-row">
+              <span className="draft-why-label">Topic</span>
+              <span>{draft.personalization.objective}</span>
+            </div>
+          )}
+          {draft.personalization.selection_reason && (
+            <div className="draft-why-row">
+              <span className="draft-why-label">Why them</span>
+              <span>
+                {typeof draft.personalization.selection_score === "number" && (
+                  <strong className="draft-why-score">
+                    {draft.personalization.selection_score}
+                  </strong>
+                )}
+                {draft.personalization.selection_reason}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="draft-field">
         <label>SUBJECT</label>

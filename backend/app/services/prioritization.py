@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.contact import Contact, ContactContext, ContactEmailLink
 from app.models.message import EmailMessage
 from app.services.ai_service import AIServiceError, _call_anthropic
+from app.services.objective_planner import format_plan
 from app.services.text_utils import is_trivial_preview, strip_quoted_reply
 
 # How many candidates one LLM call judges. Kept modest for two reasons: the model attends to
@@ -78,7 +79,7 @@ Rules:
 - Include every candidate number exactly once."""
 
 USER_TEMPLATE = """OBJECTIVE: {objective}
-
+{plan_block}
 Rank these {count} contacts for that objective.
 
 {candidates}"""
@@ -253,11 +254,18 @@ def _parse_rankings(raw: str, count: int) -> dict[int, dict]:
     return out
 
 
-def _score_batch(objective: str, briefs: list[str]) -> dict[int, dict]:
+def _score_batch(objective: str, briefs: list[str], plan_block: str = "") -> dict[int, dict]:
     """One LLM call over one batch. Pure strings in, so it is safe off the main thread."""
     raw = _call_anthropic(
         SYSTEM_PROMPT,
-        USER_TEMPLATE.format(objective=objective, count=len(briefs), candidates="\n\n".join(briefs)),
+        USER_TEMPLATE.format(
+            objective=objective,
+            # The user's answers about who qualifies, when they gave any. Blank leaves the
+            # prompt as it was before planning existed.
+            plan_block=f"\n{plan_block}\n" if plan_block else "",
+            count=len(briefs),
+            candidates="\n\n".join(briefs),
+        ),
         max_tokens=SCORING_MAX_TOKENS,
     )
     return _parse_rankings(raw, len(briefs))
@@ -272,6 +280,7 @@ async def prioritize_contacts(
     min_score: int | None = None,
     top_n: int | None = None,
     mailbox_ids: list[str] | None = None,
+    plan: dict | None = None,
 ) -> dict:
     """Rank contacts for an objective, best-first.
 
@@ -298,6 +307,7 @@ async def prioritize_contacts(
     # Briefs are built here, on the thread that owns the session: the DB session is not
     # thread-safe, so only the model calls are allowed to fan out.
     briefs = [build_candidate_brief(db, contact) for contact in candidates]
+    plan_block = format_plan(plan)
 
     batches: list[tuple[list[Contact], list[str]]] = []
     for start in range(0, len(candidates), BATCH_SIZE):
@@ -308,7 +318,10 @@ async def prioritize_contacts(
         batches.append((chunk, chunk_briefs))
 
     scored_batches = await asyncio.gather(
-        *(asyncio.to_thread(_score_batch, objective, chunk_briefs) for _, chunk_briefs in batches),
+        *(
+            asyncio.to_thread(_score_batch, objective, chunk_briefs, plan_block)
+            for _, chunk_briefs in batches
+        ),
         return_exceptions=True,
     )
 

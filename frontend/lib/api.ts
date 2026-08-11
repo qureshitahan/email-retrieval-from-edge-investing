@@ -87,6 +87,17 @@ export type ActivityNugget = {
   source_subject: string | null;
 };
 
+/** One question worth answering before searching, with the model's proposed answer. */
+export type PlanQuestion = { question: string; answer: string; why?: string };
+
+/** What the user actually meant by their objective, used to score the shortlist. */
+export type ObjectivePlan = {
+  objective: string;
+  questions: PlanQuestion[];
+  looking_for: string;
+  avoid: string;
+};
+
 /** The evidence behind a draft's opening line, shown before it is sent. */
 export type Personalization = {
   /** News worth congratulating them on. Often empty, and that is fine. */
@@ -98,6 +109,11 @@ export type Personalization = {
   studied_messages: number;
   full_bodies_read: number;
   reason: string;
+  /** The objective this draft was written for. */
+  objective?: string;
+  /** Why the ranker chose this person for that objective. */
+  selection_reason?: string;
+  selection_score?: number | null;
 };
 
 export type EmailDraft = {
@@ -356,7 +372,8 @@ export const api = {
     contactIds: string[] = [],
     limit = 200,
     topN: number | null = 50,
-    mailboxIds: string[] = []
+    mailboxIds: string[] = [],
+    plan: ObjectivePlan | null = null
   ) =>
     apiFetch<{
       objective: string;
@@ -373,6 +390,7 @@ export const api = {
         limit,
         top_n: topN,
         mailbox_ids: mailboxIds,
+        plan,
       }),
     }),
   bulkReview: (contactIds: string[], reviewStatus: "approved" | "denied" | "pending") =>
@@ -433,7 +451,8 @@ export const api = {
     contactIds: string[],
     customInstructions?: string,
     objective?: string,
-    mailboxIds: string[] = []
+    mailboxIds: string[] = [],
+    reasons: Array<{ contact_id: string; reason: string | null; score: number | null }> = []
   ) =>
     apiFetch<DraftRun>("/outreach/drafts/start", {
       method: "POST",
@@ -442,7 +461,13 @@ export const api = {
         custom_instructions: customInstructions || null,
         objective: objective || null,
         mailbox_ids: mailboxIds,
+        reasons,
       }),
+    }),
+  objectivePlan: (objective: string) =>
+    apiFetch<ObjectivePlan>("/outreach/objective/plan", {
+      method: "POST",
+      body: JSON.stringify({ objective }),
     }),
   senders: () =>
     apiFetch<{ items: SenderProfile[]; supported_extensions: string[] }>("/senders"),

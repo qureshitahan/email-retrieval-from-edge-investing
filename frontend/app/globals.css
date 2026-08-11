@@ -1201,6 +1201,85 @@ label.stacked {
   font-weight: 700;
 }
 
+/* --- the plan: what the objective actually means --- */
+.plan-box {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  background: #f6f9ff;
+  display: grid;
+  gap: 10px;
+}
+
+.plan-head {
+  display: grid;
+  gap: 2px;
+}
+
+.plan-summary {
+  margin: 0;
+}
+
+.plan-question {
+  display: grid;
+  gap: 4px;
+}
+
+.plan-q {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #1f2a44;
+}
+
+.plan-question textarea {
+  width: 100%;
+}
+
+/* --- why this person, above the subject --- */
+.draft-why {
+  margin: 0 0 10px 88px;
+  padding: 8px 12px;
+  border-left: 3px solid #cbd5e1;
+  background: #fafbfc;
+  border-radius: 0 8px 8px 0;
+  display: grid;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: #344054;
+}
+
+.draft-why-row {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.draft-why-label {
+  font-size: 0.66rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #98a2b3;
+}
+
+.draft-why-score {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: #166534;
+  color: white;
+  font-size: 0.7rem;
+}
+
+@media (max-width: 720px) {
+  .draft-why {
+    margin-left: 0;
+  }
+}
+
 /* --- bulk drafting progress --- */
 .draft-progress {
   display: grid;

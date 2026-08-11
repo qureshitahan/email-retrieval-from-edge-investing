@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DraftCard } from "@/components/DraftCard";
 import { Nav } from "@/components/Nav";
-import { api, DraftRun, EmailDraft, MailboxStatus, RankedContact } from "@/lib/api";
+import {
+  api,
+  DraftRun,
+  EmailDraft,
+  MailboxStatus,
+  ObjectivePlan,
+  RankedContact,
+} from "@/lib/api";
 
 /**
  * Objective-first outreach.
@@ -39,6 +46,12 @@ export default function CompassPage() {
   const [ranked, setRanked] = useState<RankedContact[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
+  // The answers that turn a one-line objective into a filter. Proposed by the model, edited
+  // by the user, and scored against — so "investors" can mean what Dalbir means by it.
+  const [plan, setPlan] = useState<ObjectivePlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  // mailbox id -> the signature appended to its drafts, so the line count excludes it.
+  const [signatures, setSignatures] = useState<Record<string, string>>({});
   const [summary, setSummary] = useState<string | null>(null);
 
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
@@ -67,6 +80,16 @@ export default function CompassPage() {
         prev.size > 0 ? prev : new Set(data.items.filter((m) => m.can_read).map((m) => m.id))
       );
       setError(data.config_error);
+      try {
+        const senders = await api.senders();
+        setSignatures(
+          Object.fromEntries(
+            senders.items.map((p) => [p.mailbox_id, p.effective_signature || ""])
+          )
+        );
+      } catch {
+        // A missing profile only affects the line count hint, never the draft itself.
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load mailboxes");
     } finally {
@@ -132,7 +155,36 @@ export default function CompassPage() {
     });
   }
 
-  async function handleContinue() {
+  async function handlePlan() {
+    if (!objective.trim()) {
+      setError("Describe what you want to accomplish first");
+      return;
+    }
+    setPlanning(true);
+    setError(null);
+    try {
+      const result = await api.objectivePlan(objective.trim());
+      setPlan(result);
+      if (result.questions.length === 0) {
+        // No questions worth asking — go straight to the search rather than stalling.
+        await handleContinue(result);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not plan this objective");
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  function editAnswer(index: number, answer: string) {
+    setPlan((prev) =>
+      prev
+        ? { ...prev, questions: prev.questions.map((q, i) => (i === index ? { ...q, answer } : q)) }
+        : prev
+    );
+  }
+
+  async function handleContinue(usePlan: ObjectivePlan | null = plan) {
     if (!objective.trim()) {
       setError("Describe what you want to accomplish first");
       return;
@@ -151,7 +203,8 @@ export default function CompassPage() {
         [],
         scanDepth,
         shortlistSize,
-        Array.from(included)
+        Array.from(included),
+        usePlan
       );
       setRanked(result.items);
       setSelected(new Set(result.items.map((r) => r.contact_id)));
@@ -215,7 +268,12 @@ export default function CompassPage() {
         objective.trim(),
         // Pass the searched mailboxes so each draft is pinned to the one that already
         // corresponds with its recipient.
-        Array.from(included)
+        Array.from(included),
+        chosen.map((r) => ({
+          contact_id: r.contact_id,
+          reason: r.reason,
+          score: r.objective_score,
+        }))
       );
       if (run.already_running) {
         setNotice("A drafting run was already going — showing its progress.");
@@ -508,11 +566,57 @@ export default function CompassPage() {
 
           <button
             className="button primary continue-btn"
-            onClick={handleContinue}
-            disabled={searching || !objective.trim() || included.size === 0}
+            onClick={handlePlan}
+            disabled={planning || searching || !objective.trim() || included.size === 0}
           >
-            {searching ? "Finding your people…" : "Continue"}
+            {planning
+              ? "Thinking it through…"
+              : searching
+                ? "Finding your people…"
+                : "Plan with AI"}
           </button>
+
+          {plan && plan.questions.length > 0 && (
+            /* The objective alone is too coarse to rank on: "investors" means something
+               specific to the person typing it. Every answer here is already filled in, so
+               the fast path is to read them and press the button. */
+            <div className="plan-box">
+              <div className="plan-head">
+                <strong>Before I search — is this what you mean?</strong>
+                <span className="meta">Answers are filled in for you. Edit any of them.</span>
+              </div>
+
+              {plan.looking_for && (
+                <p className="meta plan-summary">Looking for: {plan.looking_for}</p>
+              )}
+              {plan.avoid && <p className="meta plan-summary">Leaving out: {plan.avoid}</p>}
+
+              {plan.questions.map((q, i) => (
+                <label key={i} className="plan-question">
+                  <span className="plan-q">{q.question}</span>
+                  <textarea
+                    rows={2}
+                    value={q.answer}
+                    onChange={(e) => editAnswer(i, e.target.value)}
+                  />
+                  {q.why && <span className="meta">{q.why}</span>}
+                </label>
+              ))}
+
+              <div className="actions">
+                <button
+                  className="primary"
+                  onClick={() => handleContinue()}
+                  disabled={searching || included.size === 0}
+                >
+                  {searching ? "Finding your people…" : `Find my ${shortlistSize} people`}
+                </button>
+                <button className="link-btn" onClick={() => setPlan(null)} disabled={searching}>
+                  Skip these
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -734,6 +838,7 @@ export default function CompassPage() {
                 index={i}
                 total={drafts.length}
                 mailboxes={mailboxes}
+                signature={signatures[draft.sending_mailbox_id || ""] || ""}
                 selected={selectedDrafts.has(draft.id)}
                 busy={busyDraft === draft.id || sending}
                 onToggle={() =>
