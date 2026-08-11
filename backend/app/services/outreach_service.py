@@ -22,7 +22,9 @@ from app.services.personal_brief import (
     get_personal_brief,
     prewarm_briefs,
 )
+from app.models.sender import SenderProfile
 from app.services.relationship_context import build_relationship_evidence, format_relationship_evidence
+from app.services.sender_profile import format_sender_profile, signature_for
 from app.services.mail_sender import MailSendError, send_via_mailbox
 from app.services.mailboxes import MailboxConfigError, default_mailbox, get_mailbox
 
@@ -42,8 +44,14 @@ DEFAULT_SYSTEM_PROMPT = (
     "Attributing our own words to the recipient, or theirs to us, produces an email that "
     "cannot be sent, so treat the distinction as the most important thing on the page after "
     "the brief itself.\n\n"
+    "The brief also has a section headed WHO IS WRITING, holding the sender's own track record. "
+    "Use it to earn the ask: a specific, quantified thing the sender has actually done is worth "
+    "more than any adjective. One is enough — a paragraph of credentials reads as a CV, not a "
+    "note. If that section says nothing is on file, make the ask on its own merits and claim no "
+    "track record at all.\n\n"
     "Never invent facts. Do not state a job title, employer, deal, mutual contact, meeting, or "
-    "commitment that is not present in the context.\n\n"
+    "commitment that is not present in the context. Never inflate a number from the sender's "
+    "material — if it says $120M, it is not 'over $150M' and not 'more than $100M'.\n\n"
     "Never mention email volume, thread counts, or how long it has been since you last spoke. "
     "Those are internal metrics, not things one writes to a person."
 )
@@ -52,27 +60,51 @@ DEFAULT_USER_PROMPT_TEMPLATE = """Draft a short outreach email to this contact.
 
 Build the email in three beats, in this order:
 
-1. THEM. Open on something specific they have been doing, taken from WHAT THEY HAVE BEEN
-   DOING. Name the deal, company, role, or launch. If it is recent and good news, congratulate
-   them in one sentence and mean it; if it is older, refer to it as something you know about
-   rather than as news. Use their own framing where the quote gives it to you.
-   If that section says nothing was verified, open instead on the substance of the most recent
-   message THEY wrote — continue that thread rather than restarting the conversation. If they
-   have never written to us at all, say plainly why you are reaching out. Never open with a
-   generic pleasantry in either case.
+1. THEM. Open on something specific about them, in this order of preference:
+   a. something from WHAT THEY HAVE BEEN DOING — name the deal, company, role or launch. If it
+      is recent and good news, congratulate them in one sentence and mean it; if it is older,
+      refer to it as something you know about rather than as news.
+   b. otherwise something from WHAT ELSE WE KNOW ABOUT THEM — an offer they made, a question
+      they asked, what they are working on, where you met. These are just as personal; "you
+      mentioned you could introduce me to your partners in the US" opens an email perfectly.
+   c. only if both are empty, the substance of the most recent message THEY wrote — continue
+      that thread rather than restarting the conversation.
+   Use their own framing where a quote gives it to you. If they have never written to us at
+   all, say plainly why you are reaching out. Never open with a generic pleasantry.
 
-2. THE BRIDGE. One sentence that connects what they are doing to why you are writing now. This
-   is where the email earns the ask — the link should be real, not a pivot.
+2. THE BRIDGE. One sentence that connects what they are doing to why you are writing now, and
+   where the sender's own credibility belongs if it belongs anywhere. At most one concrete
+   thing from WHO IS WRITING, chosen because it makes this particular ask reasonable to this
+   particular person.
 
 3. THE ASK. The purpose of the outreach, stated once, as a low-friction next step.
 
+The SUBJECT LINE must be specific to this person and this ask — something they would open
+because it is obviously not a mass send. Name the concrete thing: the company, the deal, the
+introduction, the role. No more than about eight words. Never a generic label like "Quick
+question", "Following up" or "Introduction".
+
+FORMAT, exactly:
+- First line is a greeting: "Hi <first name>," — nothing before it.
+- Blank line, then the body in short paragraphs separated by blank lines.
+- Blank line, then "Best regards" on its own line.
+
+You always produce an email. Never refuse, never explain yourself, never comment on the brief
+or on how well the objective fits this person, and never use markdown. If the objective is a
+poor fit for this relationship — they are a supplier rather than an investor, a recruiter
+rather than a partner — do not force the pitch and do not raise the mismatch. Write a short,
+genuine note that fits the relationship you actually have and make the ask lightly, or simply
+continue the conversation. A brief honest email is always the right answer; a paragraph
+explaining your concerns is never an email and cannot be sent.
+
 Rules:
 - Only reference specifics that appear in the context. Precision beats warmth.
-- Do not stack achievements. One opener, well chosen, beats three.
+- Do not stack achievements — theirs or the sender's. One of each, well chosen, beats three.
 - Professional and warm, but direct. No filler openings, no flattery beyond the facts.
 - Body under 160 words. Shorter is better.
 - No placeholders like [Name] or [Company] — use the real values or omit the sentence.
-- Sign off as "Best regards" with no name (the sender adds their own signature).
+- Sign off as "Best regards" with no name. The sender's signature block is appended
+  afterwards, so writing a name here would produce two.
 
 {custom_instructions_block}
 
@@ -106,6 +138,29 @@ _LEGACY_SYSTEM_PROMPTS = {
         "Never mention email volume, thread counts, or how long it has been since you last spoke. "
         "Those are internal metrics, not things one writes to a person."
     ),
+    # The stock prompt before the sender profile existed: it studied the recipient well but
+    # knew nothing about who was writing, so every pitch read the same.
+    (
+        "You write outreach emails for Edge Investing / Galaxy Pharma.\n\n"
+        "The email must read as though the sender has been paying attention to the recipient. A "
+        "note that could have been sent to anybody is a failure even when every sentence in it is "
+        "true. The brief includes a section headed WHAT THEY HAVE BEEN DOING, listing things the "
+        "recipient has actually been up to, each one quoted from their own mail — leading with one "
+        "of those is the single most important thing you do.\n\n"
+        "That section is also a limit. Congratulate, acknowledge, or allude to nothing that is not "
+        "in it. When it says nothing was verified, it means the mail contains no news about this "
+        "person: open on the last real message instead, and never fall back on 'hope all is well "
+        "at <company>' or an invented achievement. Congratulating someone on something that did "
+        "not happen loses the relationship outright.\n\n"
+        "The context labels every past message with who wrote it — either WE WROTE or THEY WROTE. "
+        "Attributing our own words to the recipient, or theirs to us, produces an email that "
+        "cannot be sent, so treat the distinction as the most important thing on the page after "
+        "the brief itself.\n\n"
+        "Never invent facts. Do not state a job title, employer, deal, mutual contact, meeting, or "
+        "commitment that is not present in the context.\n\n"
+        "Never mention email volume, thread counts, or how long it has been since you last spoke. "
+        "Those are internal metrics, not things one writes to a person."
+    ),
 }
 
 _LEGACY_USER_PROMPTS = {
@@ -127,6 +182,41 @@ Subject: <subject line>
 <body paragraphs>
 
 Contact context:
+{context}""",
+    """Draft a short outreach email to this contact.
+
+Build the email in three beats, in this order:
+
+1. THEM. Open on something specific they have been doing, taken from WHAT THEY HAVE BEEN
+   DOING. Name the deal, company, role, or launch. If it is recent and good news, congratulate
+   them in one sentence and mean it; if it is older, refer to it as something you know about
+   rather than as news. Use their own framing where the quote gives it to you.
+   If that section says nothing was verified, open instead on the substance of the most recent
+   message THEY wrote — continue that thread rather than restarting the conversation. If they
+   have never written to us at all, say plainly why you are reaching out. Never open with a
+   generic pleasantry in either case.
+
+2. THE BRIDGE. One sentence that connects what they are doing to why you are writing now. This
+   is where the email earns the ask — the link should be real, not a pivot.
+
+3. THE ASK. The purpose of the outreach, stated once, as a low-friction next step.
+
+Rules:
+- Only reference specifics that appear in the context. Precision beats warmth.
+- Do not stack achievements. One opener, well chosen, beats three.
+- Professional and warm, but direct. No filler openings, no flattery beyond the facts.
+- Body under 160 words. Shorter is better.
+- No placeholders like [Name] or [Company] — use the real values or omit the sentence.
+- Sign off as "Best regards" with no name (the sender adds their own signature).
+
+{custom_instructions_block}
+
+Return ONLY in this format, with nothing before or after:
+Subject: <subject line>
+
+<body paragraphs>
+
+=== CONTEXT ===
 {context}""",
     """Draft a short outreach email to this contact.
 
@@ -204,6 +294,83 @@ def _parse_draft_response(text: str) -> tuple[str, str]:
     return "", "\n".join(candidates).strip()
 
 
+# Openings and phrases that mean the model talked *about* the email instead of writing one.
+# This happened in production: asked to pitch fundraising to an IT supplier, it returned
+# "I need to pause before drafting this email. **The context creates a serious mismatch...**",
+# which was stored with an empty subject and shown as ready to send.
+_REFUSAL_OPENERS = (
+    "i need to pause",
+    "i should flag",
+    "i can't",
+    "i cannot",
+    "i won't",
+    "i will not",
+    "before drafting",
+    "before i draft",
+    "a note on",
+    "note:",
+    "important:",
+    "caveat",
+    "i'd recommend not",
+    "i would recommend not",
+    "i have a concern",
+    "here's my concern",
+    "this doesn't look right",
+)
+_REFUSAL_PHRASES = (
+    "mismatch with the ask",
+    "creates a serious mismatch",
+    "i'm not going to",
+    "i am not going to",
+    "would not be appropriate",
+    "is not appropriate to send",
+    "recommend against sending",
+    "cannot write this email",
+    "should not be sent",
+)
+MAX_DRAFT_BODY_WORDS = 400
+
+
+def validate_draft(subject: str, body: str) -> str | None:
+    """None when this is a sendable email, else a short reason why it is not.
+
+    The parser is deliberately forgiving about formatting, which means it will happily turn a
+    refusal into a body with no subject. This is the check that stops that reaching the review
+    screen looking like a finished draft.
+    """
+    subject = (subject or "").strip()
+    body = (body or "").strip()
+
+    if not subject:
+        return "the model returned no subject line"
+    if not body:
+        return "the model returned no message body"
+    if len(subject) > 160:
+        return "the subject line is a paragraph, not a subject"
+
+    lowered = body.lower()
+    head = lowered[:500]
+    if any(head.lstrip().startswith(marker) for marker in _REFUSAL_OPENERS):
+        return "the model commented on the request instead of writing the email"
+    if any(phrase in head for phrase in _REFUSAL_PHRASES):
+        return "the model raised a concern instead of writing the email"
+    # Markdown headers and bold are how it formats commentary; a real email has neither.
+    if "**" in body or body.lstrip().startswith("#"):
+        return "the model returned notes rather than an email"
+    if len(body.split()) > MAX_DRAFT_BODY_WORDS:
+        return "the response is far too long to be the email that was asked for"
+    return None
+
+
+RETRY_INSTRUCTION = (
+    "\n\nYour previous response was not an email and could not be used. Output ONLY a subject "
+    "line and an email body, in exactly the format asked for above, starting with "
+    "'Subject: '. Do not explain, do not comment on the brief, do not use markdown, and do not "
+    "raise concerns about whether the objective suits this person. If the objective does not "
+    "fit them, write a short genuine note that suits the relationship instead."
+)
+
+
 def get_or_create_prompt(db: Session) -> OutreachPrompt:
     row = db.query(OutreachPrompt).filter(OutreachPrompt.id == "default").one_or_none()
     if row:
@@ -262,21 +429,157 @@ def build_user_prompt(
     return template.replace("{custom_instructions_block}", block).replace("{context}", context)
 
 
-def build_draft_context(db: Session, contact, messages, brief: dict | None = None) -> str:
+def sender_profile_for(db: Session, mailbox_id: str | None):
+    """The profile of whichever mailbox this draft will go out from, if there is one."""
+    if not mailbox_id:
+        return None
+    return (
+        db.query(SenderProfile)
+        .filter(SenderProfile.mailbox_id == mailbox_id)
+        .one_or_none()
+    )
+
+
+_GREETING_RE = re.compile(r"^(hi|hello|hey|dear|good morning|good afternoon)\b", re.IGNORECASE)
+
+# Honorifics, and the role words that mean the address has no person behind it.
+_NOT_A_FIRST_NAME = {
+    "dr", "mr", "mrs", "ms", "miss", "prof", "professor", "sir", "rev", "hon",
+    "info", "team", "sales", "support", "admin", "the", "office", "contact", "hello",
+}
+
+
+def first_name_for(full_name: str | None, email: str | None) -> str:
+    """A name to greet someone by, or "there" when nothing usable is on file.
+
+    Handles the shapes that actually appear in a mailbox: quoted names, "Surname, First"
+    from directory exports, and role addresses with no person behind them at all.
+    """
+    name = (full_name or "").strip().strip("'\"")
+    if "," in name:
+        # "Warga, Brent" is a directory export, not a person called Warga.
+        after = name.split(",", 1)[1].strip()
+        if after:
+            name = after
+    # "Dr. Anjan Chatterji" must greet Anjan, not Dr.
+    parts = [re.sub(r"[^A-Za-z'\-]", "", part) for part in re.split(r"[\s.]+", name)]
+    token = next(
+        (part for part in parts if len(part) >= 2 and part.lower() not in _NOT_A_FIRST_NAME),
+        "",
+    )
+    if token:
+        return token[:1].upper() + token[1:]
+
+    local = (email or "").split("@", 1)[0]
+    token = re.sub(r"[^A-Za-z'\-]", "", re.split(r"[._\-]+", local)[0] if local else "")
+    if len(token) >= 2 and token.lower() not in _NOT_A_FIRST_NAME:
+        return token[:1].upper() + token[1:]
+    return "there"
+
+
+def ensure_greeting(body: str, first_name: str) -> str:
+    """Guarantee the email opens on a greeting line of its own.
+
+    Left to the prompt alone this came out three different ways — "Hi Tyler,", a bare "Tyler,",
+    and the name folded into the first sentence ("Jasman, you asked me to…"). A greeting is a
+    fixed piece of structure, not a judgement call, so it is applied here rather than asked for.
+    """
+    text = (body or "").lstrip()
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    first = lines[0].strip()
+
+    if _GREETING_RE.match(first):
+        return text
+
+    # "Tyler," alone on the first line — the right shape, just missing the greeting word.
+    if re.fullmatch(rf"{re.escape(first_name)}\s*[,:—-]?", first, re.IGNORECASE):
+        lines[0] = f"Hi {first_name},"
+        return "\n".join(lines)
+
+    # "Jasman, you asked me to…" — the name is doing double duty as greeting and sentence.
+    # Lift it out and promote the remainder to the opening sentence.
+    inline = re.match(rf"{re.escape(first_name)}\s*[,—-]\s+(.+)", first, re.IGNORECASE)
+    if inline:
+        rest = inline.group(1).strip()
+        rest = rest[:1].upper() + rest[1:] if rest else ""
+        lines[0] = rest
+        return f"Hi {first_name},\n\n" + "\n".join(lines).lstrip()
+
+    return f"Hi {first_name},\n\n{text}"
+
+
+def append_signature(body: str, signature: str) -> str:
+    """Put the sender's signature at the end of a draft, replacing a bare sign-off.
+
+    The model is told to end on "Best regards" with no name; leaving that above a full block
+    produces two sign-offs. Anything the model already wrote below it is dropped rather than
+    kept, because that is invariably a hallucinated name.
+    """
+    text = (body or "").rstrip()
+    signature = (signature or "").strip()
+    if not signature:
+        return text
+
+    if _normalize_signature(signature) and _normalize_signature(signature) in _normalize_signature(text):
+        return text  # already signed, e.g. a regenerate over an edited draft
+
+    lines = text.split("\n")
+    for index in range(len(lines) - 1, max(len(lines) - 5, -1), -1):
+        stripped = lines[index].strip().rstrip(",.").lower()
+        if stripped in _SIGN_OFFS:
+            return "\n".join(lines[:index]).rstrip() + f"\n\n{signature}"
+    return text + f"\n\n{signature}"
+
+
+_SIGN_OFFS = {
+    "best regards",
+    "best",
+    "kind regards",
+    "regards",
+    "warm regards",
+    "sincerely",
+    "thanks",
+    "thank you",
+    "cheers",
+    "many thanks",
+}
+
+
+def _normalize_signature(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def build_draft_context(
+    db: Session,
+    contact,
+    messages,
+    brief: dict | None = None,
+    sender=None,
+    *,
+    sender_name: str | None = None,
+    sender_missing: bool = False,
+) -> str:
     """Grounding for a draft, ordered by how much it shapes the email.
 
-    The brief goes first because it decides the opening line, which is the part of the email
-    that determines whether it reads as written to this person or to a list. Relationship
-    evidence follows — it separates the last message *from them* from the last *from us*, so
-    the draft continues the right conversation — then their own recent messages in full, then
-    the labelled log of both sides.
+    The recipient brief goes first because it decides the opening line, which is what
+    determines whether the email reads as written to this person or to a list. The sender
+    profile follows, because it decides whether the middle of the email is worth reading — a
+    draft that knows everything about its recipient and nothing about its sender still opens
+    well and then pitches like a form letter. Relationship evidence comes next (it separates
+    the last message *from them* from the last *from us*, so the draft continues the right
+    conversation), then their own recent messages in full, then the labelled log of both sides.
 
-    ``brief`` is optional so the older callers that only have a contact and a message list keep
-    working; without it the context is exactly what it was before, minus the opening angle.
+    ``brief`` and ``sender`` are optional so the older callers that only have a contact and a
+    message list keep working; without them the context is what it was before.
     """
     sections: list[str] = []
     if brief is not None:
         sections.append(format_personal_brief(brief))
+    if sender is not None or sender_missing:
+        sections.append(format_sender_profile(sender, sender_name))
     sections.append(format_relationship_evidence(build_relationship_evidence(db, contact)))
     own_words = format_their_own_words(brief)
     if own_words:
@@ -311,8 +614,9 @@ def summarize_personalization(brief: dict | None) -> dict:
     email can be checked against the mail it came from without leaving the review screen.
     """
     brief = brief or {}
-    return {
-        "activity": [
+
+    def strip(items) -> list[dict]:
+        return [
             {
                 "headline": item.get("headline"),
                 "detail": item.get("detail"),
@@ -322,11 +626,16 @@ def summarize_personalization(brief: dict | None) -> dict:
                 "is_recent": item.get("is_recent", False),
                 "source_subject": item.get("source_subject"),
             }
-            for item in (brief.get("activity") or [])
-        ],
+            for item in (items or [])
+        ]
+
+    return {
+        "activity": strip(brief.get("activity")),
+        "about_them": strip(brief.get("about_them")),
         "focus": brief.get("focus") or [],
         "note": brief.get("note") or "",
         "studied_messages": brief.get("studied_messages", 0),
+        "full_bodies_read": brief.get("full_bodies_read", 0),
         "reason": brief.get("reason") or "",
     }
 
@@ -339,6 +648,7 @@ async def generate_draft_for_contact(
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
     restudy: bool = False,
+    selection: dict | None = None,
 ) -> EmailDraft:
     contact = _get_contact(db, contact_id)
     if contact.review_status != "approved":
@@ -349,7 +659,37 @@ async def generate_draft_for_contact(
     # Read what this person has been doing before writing to them. Cached per contact and
     # refreshed when they write again, so a bulk run studies each person once.
     brief = await get_personal_brief(db, contact, force=restudy)
-    context = build_draft_context(db, contact, messages, brief)
+
+    # Decide the sending identity *before* writing, not after: the email argues from that
+    # sender's track record and is signed by them, so choosing the mailbox afterwards would
+    # mean a Galaxy pitch going out over an Edge Investing signature.
+    existing_draft = (
+        db.query(EmailDraft)
+        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved", "failed"]))
+        .order_by(EmailDraft.created_at.desc())
+        .first()
+    )
+    mailbox_id = (existing_draft.sending_mailbox_id if existing_draft else None) or resolve_source_mailbox(
+        db, contact_id, mailbox_ids
+    )
+    sender = sender_profile_for(db, mailbox_id)
+    sender_name = None
+    if mailbox_id:
+        try:
+            mailbox = get_mailbox(mailbox_id)
+            sender_name = (mailbox.from_name or "").strip() or None
+        except MailboxConfigError:
+            mailbox = None
+
+    context = build_draft_context(
+        db,
+        contact,
+        messages,
+        brief,
+        sender,
+        sender_name=sender_name,
+        sender_missing=bool(mailbox_id),
+    )
 
     instructions = custom_instructions
     if objective and objective.strip():
@@ -363,27 +703,54 @@ async def generate_draft_for_contact(
     raw = await _call_anthropic_async(prompt_row.system_prompt, user_prompt)
     subject, body = _parse_draft_response(raw)
 
+    # One corrective retry before giving up. A response that talks about the email instead of
+    # being one is nearly always fixed by saying so plainly, and it is far better to spend a
+    # second call than to put commentary in front of a real client as a finished draft.
+    problem = validate_draft(subject, body)
+    if problem:
+        retry = await _call_anthropic_async(
+            prompt_row.system_prompt, user_prompt + RETRY_INSTRUCTION
+        )
+        retry_subject, retry_body = _parse_draft_response(retry)
+        if validate_draft(retry_subject, retry_body) is None:
+            subject, body, problem = retry_subject, retry_body, None
+
+    body = ensure_greeting(body, first_name_for(contact.full_name, contact.primary_email))
+    body = append_signature(body, signature_for(sender, sender_name))
+
     existing = (
         db.query(EmailDraft)
-        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved"]))
+        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved", "failed"]))
         .order_by(EmailDraft.created_at.desc())
         .first()
     )
     draft = existing or EmailDraft(contact_id=contact_id)
     draft.subject = subject
     draft.body = body
-    draft.status = "draft"
+    # A draft that failed validation is kept so the reviewer can see what came back and why,
+    # but it is marked failed rather than "draft": it must not sit in the review list looking
+    # ready, and "send all" must skip it.
+    draft.status = "failed" if problem else "draft"
+    draft.error_message = (
+        f"Not sent — {problem}. Press Regenerate to try again." if problem else None
+    )
     draft.custom_instructions = instructions
     draft.system_prompt = prompt_row.system_prompt
     draft.user_prompt = user_prompt
-    draft.personalization = summarize_personalization(brief)
-    draft.error_message = None
+    draft.personalization = {
+        **summarize_personalization(brief),
+        # Why this person was chosen and for what. Stored on the draft rather than held in the
+        # page, so the review card still explains itself after a reload.
+        "objective": (objective or "").strip(),
+        "selection_reason": (selection or {}).get("reason") or "",
+        "selection_score": (selection or {}).get("score"),
+    }
     draft.updated_at = datetime.utcnow()
 
     # Route the reply back through the mailbox that already holds this relationship, so a
-    # bulk send needs no per-draft decision. An identity chosen by hand is left alone.
-    if not draft.sending_mailbox_id:
-        draft.sending_mailbox_id = resolve_source_mailbox(db, contact_id, mailbox_ids)
+    # bulk send needs no per-draft decision. An identity chosen by hand is left alone; either
+    # way it matches the profile and signature the email was written from above.
+    draft.sending_mailbox_id = draft.sending_mailbox_id or mailbox_id
 
     if not existing:
         db.add(draft)
@@ -400,6 +767,7 @@ async def generate_drafts_bulk(
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
     restudy: bool = False,
+    selections: dict[str, dict] | None = None,
 ) -> list[dict]:
     # Study everyone first, together. Writing the emails one after another is fine — it is fast
     # and each one needs the previous commit — but making each contact wait for the previous
@@ -418,6 +786,7 @@ async def generate_drafts_bulk(
                 # The prewarm above already honoured ``restudy``. Passing it on would study
                 # every contact a second time, at full cost, for an identical answer.
                 restudy=False,
+                selection=(selections or {}).get(contact_id),
             )
             results.append({"contact_id": contact_id, "draft_id": draft.id, "status": "ok"})
         except Exception as exc:
@@ -556,6 +925,7 @@ def create_draft_run(
     custom_instructions: str | None = None,
     objective: str | None = None,
     mailbox_ids: list[str] | None = None,
+    selections: dict[str, dict] | None = None,
 ) -> DraftRun:
     """Queue a bulk drafting job. Raises if one is already running.
 
@@ -577,6 +947,7 @@ def create_draft_run(
         mailbox_ids=list(mailbox_ids or []),
         objective=objective,
         custom_instructions=custom_instructions,
+        selections=selections or {},
         draft_ids=[],
         errors=[],
     )
@@ -629,6 +1000,7 @@ async def run_draft_job(db_factory, run_id: str) -> None:
                         custom_instructions=run.custom_instructions,
                         objective=run.objective,
                         mailbox_ids=run.mailbox_ids or None,
+                        selection=(run.selections or {}).get(contact_id),
                     )
                     draft_ids.append(draft.id)
                     run.completed += 1
@@ -809,6 +1181,10 @@ async def send_draft(db: Session, draft_id: str, *, mailbox_id: str | None = Non
         raise OutreachError("Draft not found")
     if draft.status == "sent":
         raise OutreachError("Draft already sent")
+    if draft.status == "failed":
+        raise OutreachError(
+            draft.error_message or "This draft did not generate correctly — regenerate it first"
+        )
     contact = draft.contact
     if not contact:
         raise OutreachError("Contact not found")

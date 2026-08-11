@@ -8,6 +8,7 @@ from app.database import SessionLocal, get_db
 from app.models.outreach import DraftRun
 from app.services.ai_service import AIServiceError
 from app.services.mailboxes import MailboxConfigError, load_mailboxes
+from app.services.objective_planner import build_objective_plan
 from app.services.prioritization import prioritize_contacts
 from app.services.outreach_service import (
     DraftRunAlreadyActive,
@@ -39,6 +40,12 @@ class PromptUpdate(BaseModel):
     user_prompt_template: str | None = None
 
 
+class SelectionReason(BaseModel):
+    contact_id: str
+    reason: str | None = None
+    score: int | None = None
+
+
 class GenerateDraftsRequest(BaseModel):
     contact_ids: list[str] = []
     custom_instructions: str | None = None
@@ -46,6 +53,8 @@ class GenerateDraftsRequest(BaseModel):
     # Mailboxes the objective was searched across. Each draft is pinned to whichever of them
     # already corresponds with that contact, so a later "send all" needs no further input.
     mailbox_ids: list[str] = []
+    # Why the ranker picked each of these people, so the review card can show it.
+    reasons: list[SelectionReason] = []
 
 
 class SingleGenerateRequest(BaseModel):
@@ -69,6 +78,22 @@ class SendIn(BaseModel):
     mailbox_id: str | None = None
 
 
+class ObjectivePlanRequest(BaseModel):
+    objective: str
+
+
+class PlanAnswer(BaseModel):
+    question: str
+    answer: str
+
+
+class ObjectivePlan(BaseModel):
+    objective: str | None = None
+    questions: list[PlanAnswer] = []
+    looking_for: str | None = None
+    avoid: str | None = None
+
+
 class PrioritizeRequest(BaseModel):
     objective: str
     contact_ids: list[str] = []
@@ -81,6 +106,9 @@ class PrioritizeRequest(BaseModel):
     min_score: int | None = None
     # "Where should I look" - restrict candidates to people these mailboxes have emailed.
     mailbox_ids: list[str] = []
+    # The answers to the planning questions, as edited by the user. Scored alongside the
+    # objective so the shortlist reflects what they actually meant by it.
+    plan: ObjectivePlan | None = None
 
 
 @router.get("/mailboxes")
@@ -105,9 +133,27 @@ async def post_prioritize(payload: PrioritizeRequest, db: Session = Depends(get_
             min_score=payload.min_score,
             top_n=payload.top_n,
             mailbox_ids=payload.mailbox_ids or None,
+            plan=payload.plan.model_dump() if payload.plan else None,
         )
     except AIServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/objective/plan")
+async def post_objective_plan(payload: ObjectivePlanRequest):
+    """Questions worth answering before searching, each with a proposed answer.
+
+    Answered by the model so the default path stays one click; everything it proposes is a
+    suggestion the user edits before it is used.
+    """
+    if not payload.objective.strip():
+        raise HTTPException(status_code=400, detail="Describe what you want to accomplish first")
+    try:
+        mailboxes = load_mailboxes()
+        who = ", ".join(m.label for m in mailboxes)
+    except MailboxConfigError:
+        who = ""
+    return await build_objective_plan(payload.objective, who)
 
 
 @router.get("/prompt")
@@ -152,6 +198,7 @@ async def post_generate_drafts(payload: GenerateDraftsRequest, db: Session = Dep
         custom_instructions=payload.custom_instructions,
         objective=payload.objective,
         mailbox_ids=payload.mailbox_ids or None,
+        selections={r.contact_id: {"reason": r.reason, "score": r.score} for r in payload.reasons},
     )
     draft_ids = [r["draft_id"] for r in results if r.get("draft_id")]
     drafts = list_drafts(db)
@@ -181,6 +228,9 @@ def post_start_drafting(
             custom_instructions=payload.custom_instructions,
             objective=payload.objective,
             mailbox_ids=payload.mailbox_ids or None,
+            selections={
+                r.contact_id: {"reason": r.reason, "score": r.score} for r in payload.reasons
+            },
         )
     except DraftRunAlreadyActive as exc:
         # Not an error worth stopping for: hand back the run in progress so the page attaches

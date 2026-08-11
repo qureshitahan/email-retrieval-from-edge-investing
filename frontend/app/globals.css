@@ -973,6 +973,313 @@ th .info-tip-popover::before {
   color: #b42318;
 }
 
+/* --- why this person made the shortlist --- */
+.ranked-main {
+  display: contents;
+}
+
+.ranked-evidence {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
+
+.evidence-block {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f4f6fa;
+  border: 1px solid #e4e8ee;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: #344054;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* --- sender profile --- */
+.sender-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.sender-list {
+  display: grid;
+  gap: 8px;
+}
+
+.sender-pick {
+  display: grid;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid #e4e8ee;
+  border-radius: 10px;
+  background: white;
+  cursor: pointer;
+}
+
+.sender-pick.selected {
+  border-color: #4f75d1;
+  box-shadow: 0 0 0 3px rgba(79, 117, 209, 0.1);
+}
+
+.sender-detail {
+  display: grid;
+  gap: 16px;
+}
+
+.card {
+  border: 1px solid #e4e8ee;
+  border-radius: 12px;
+  background: white;
+  padding: 16px;
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.field-grid label,
+label.stacked {
+  display: grid;
+  gap: 4px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #5b6475;
+}
+
+label.stacked {
+  margin: 10px 0;
+}
+
+.signature-preview {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f6f9ff;
+  border: 1px solid #d6e4ff;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+.proof-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.proof-list textarea {
+  width: 100%;
+}
+
+.proof-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.proof-quote {
+  margin: 4px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid #c7d7f5;
+  font-size: 0.78rem;
+  font-style: italic;
+  color: #5b6475;
+}
+
+.keyword-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #eef0f4;
+}
+
+.keyword {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef3fc;
+  color: #3f5fa8;
+  font-size: 0.72rem;
+}
+
+.doc-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.doc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.doc-tag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #eef3fc;
+  color: #3f5fa8;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.meta.warn {
+  color: #b54708;
+}
+
+.draft-brief-sub {
+  display: block;
+  margin-top: 10px;
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #8a93a5;
+}
+
+@media (max-width: 900px) {
+  .sender-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* A short plain-English note explaining a panel to someone seeing it for the first time. */
+.explainer {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f6f9ff;
+  border: 1px solid #d6e4ff;
+  font-size: 0.82rem;
+  color: #344054;
+}
+
+.explainer p {
+  margin: 0 0 6px;
+}
+
+.explainer p:last-child {
+  margin-bottom: 0;
+}
+
+.draft-brief-explainer {
+  margin: 6px 0 2px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: #4c586e;
+}
+
+/* A draft that did not generate. Marked clearly so it is never mistaken for one ready to go. */
+.draft-card.failed {
+  border-color: #f3c6c0;
+  background: #fffaf9;
+}
+
+.draft-status.failed {
+  color: #b42318;
+  font-weight: 700;
+}
+
+/* --- the plan: what the objective actually means --- */
+.plan-box {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #d6e4ff;
+  border-radius: 10px;
+  background: #f6f9ff;
+  display: grid;
+  gap: 10px;
+}
+
+.plan-head {
+  display: grid;
+  gap: 2px;
+}
+
+.plan-summary {
+  margin: 0;
+}
+
+.plan-question {
+  display: grid;
+  gap: 4px;
+}
+
+.plan-q {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #1f2a44;
+}
+
+.plan-question textarea {
+  width: 100%;
+}
+
+/* --- why this person, above the subject --- */
+.draft-why {
+  margin: 0 0 10px 88px;
+  padding: 8px 12px;
+  border-left: 3px solid #cbd5e1;
+  background: #fafbfc;
+  border-radius: 0 8px 8px 0;
+  display: grid;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: #344054;
+}
+
+.draft-why-row {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.draft-why-label {
+  font-size: 0.66rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #98a2b3;
+}
+
+.draft-why-score {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: #166534;
+  color: white;
+  font-size: 0.7rem;
+}
+
+@media (max-width: 720px) {
+  .draft-why {
+    margin-left: 0;
+  }
+}
+
 /* --- bulk drafting progress --- */
 .draft-progress {
   display: grid;

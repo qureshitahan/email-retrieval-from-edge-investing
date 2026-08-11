@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.contact import Contact, ContactContext, ContactEmailLink
 from app.models.message import EmailMessage
 from app.services.ai_service import AIServiceError, _call_anthropic
+from app.services.objective_planner import format_plan
 from app.services.text_utils import is_trivial_preview, strip_quoted_reply
 
 # How many candidates one LLM call judges. Kept modest for two reasons: the model attends to
@@ -44,6 +45,21 @@ DEFAULT_SCAN = 200
 MAX_SCAN = 600
 SUBJECT_SAMPLES = 4
 BRIEF_EXCERPT_CHARS = 200
+
+
+def own_addresses() -> set[str]:
+    """Every address the user sends from, lower-cased.
+
+    Read from the configured mailboxes rather than a hard-coded list, so adding a fourth
+    mailbox does not silently reintroduce the "drafted an email to myself" case. A mailbox
+    configuration error is not worth failing a search over — the filter just does less.
+    """
+    try:
+        from app.services.mailboxes import load_mailboxes
+
+        return {mailbox.from_email.strip().lower() for mailbox in load_mailboxes() if mailbox.from_email}
+    except Exception:  # noqa: BLE001
+        return set()
 
 SYSTEM_PROMPT = """You rank business contacts against a specific objective.
 
@@ -63,7 +79,7 @@ Rules:
 - Include every candidate number exactly once."""
 
 USER_TEMPLATE = """OBJECTIVE: {objective}
-
+{plan_block}
 Rank these {count} contacts for that objective.
 
 {candidates}"""
@@ -169,6 +185,12 @@ def shortlist_candidates(
         Contact.email_count > 0,
     )
 
+    # The sender's own addresses turn up as contacts because they appear on their own mail.
+    # A shortlist that offers to draft an outreach email to yourself is never right.
+    own = own_addresses()
+    if own:
+        query = query.filter(func.lower(Contact.primary_email).notin_(own))
+
     if mailbox_ids:
         from_selected = (
             db.query(ContactEmailLink.id)
@@ -232,11 +254,18 @@ def _parse_rankings(raw: str, count: int) -> dict[int, dict]:
     return out
 
 
-def _score_batch(objective: str, briefs: list[str]) -> dict[int, dict]:
+def _score_batch(objective: str, briefs: list[str], plan_block: str = "") -> dict[int, dict]:
     """One LLM call over one batch. Pure strings in, so it is safe off the main thread."""
     raw = _call_anthropic(
         SYSTEM_PROMPT,
-        USER_TEMPLATE.format(objective=objective, count=len(briefs), candidates="\n\n".join(briefs)),
+        USER_TEMPLATE.format(
+            objective=objective,
+            # The user's answers about who qualifies, when they gave any. Blank leaves the
+            # prompt as it was before planning existed.
+            plan_block=f"\n{plan_block}\n" if plan_block else "",
+            count=len(briefs),
+            candidates="\n\n".join(briefs),
+        ),
         max_tokens=SCORING_MAX_TOKENS,
     )
     return _parse_rankings(raw, len(briefs))
@@ -251,6 +280,7 @@ async def prioritize_contacts(
     min_score: int | None = None,
     top_n: int | None = None,
     mailbox_ids: list[str] | None = None,
+    plan: dict | None = None,
 ) -> dict:
     """Rank contacts for an objective, best-first.
 
@@ -277,6 +307,7 @@ async def prioritize_contacts(
     # Briefs are built here, on the thread that owns the session: the DB session is not
     # thread-safe, so only the model calls are allowed to fan out.
     briefs = [build_candidate_brief(db, contact) for contact in candidates]
+    plan_block = format_plan(plan)
 
     batches: list[tuple[list[Contact], list[str]]] = []
     for start in range(0, len(candidates), BATCH_SIZE):
@@ -287,9 +318,14 @@ async def prioritize_contacts(
         batches.append((chunk, chunk_briefs))
 
     scored_batches = await asyncio.gather(
-        *(asyncio.to_thread(_score_batch, objective, chunk_briefs) for _, chunk_briefs in batches),
+        *(
+            asyncio.to_thread(_score_batch, objective, chunk_briefs, plan_block)
+            for _, chunk_briefs in batches
+        ),
         return_exceptions=True,
     )
+
+    brief_by_contact = {contact.id: briefs[i] for i, contact in enumerate(candidates)}
 
     items: list[dict] = []
     failed_batches = 0
@@ -313,6 +349,10 @@ async def prioritize_contacts(
                     # instead of implying the contact was judged irrelevant.
                     "objective_score": ranked["score"] if ranked else None,
                     "reason": ranked["reason"] if ranked else None,
+                    # Exactly what the model was shown about this person. Returned so the
+                    # shortlist can prove why someone made it, rather than asking the reader to
+                    # trust a score: a wrong pick is only obvious next to its evidence.
+                    "evidence": brief_by_contact.get(contact.id),
                 }
             )
 

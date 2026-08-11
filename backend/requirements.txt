@@ -9,3 +9,8 @@ openpyxl>=3.1.5
 msal>=1.31.0
 anthropic>=0.42.0
 eval-type-backport>=0.2.0
+# Sender profile documents: résumés and bios arrive as PDF and DOCX, and the upload endpoint
+# needs multipart form parsing.
+pypdf>=6.0.0
+python-docx>=1.1.0
+python-multipart>=0.0.9

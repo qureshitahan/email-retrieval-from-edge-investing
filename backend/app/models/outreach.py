@@ -59,6 +59,8 @@ class DraftRun(Base):
     custom_instructions: Mapped[str | None] = mapped_column(Text)
     contact_ids: Mapped[list | None] = mapped_column(JSON)
     mailbox_ids: Mapped[list | None] = mapped_column(JSON)
+    # contact_id -> {reason, score} from the ranking that produced this batch.
+    selections: Mapped[dict | None] = mapped_column(JSON)
     draft_ids: Mapped[list | None] = mapped_column(JSON)
     errors: Mapped[list | None] = mapped_column(JSON)
     error_message: Mapped[str | None] = mapped_column(Text)

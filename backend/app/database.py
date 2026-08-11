@@ -171,6 +171,12 @@ def run_migrations() -> None:
             if "personalization" not in draft_columns:
                 conn.execute(text("ALTER TABLE email_drafts ADD COLUMN personalization JSON"))
 
+    if "draft_runs" in inspector.get_table_names():
+        run_cols = {column["name"] for column in inspector.get_columns("draft_runs")}
+        with engine.begin() as conn:
+            if "selections" not in run_cols:
+                conn.execute(text("ALTER TABLE draft_runs ADD COLUMN selections JSON"))
+
     if "contacts" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("contacts")}
         with engine.begin() as conn:

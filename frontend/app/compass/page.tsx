@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DraftCard } from "@/components/DraftCard";
 import { Nav } from "@/components/Nav";
-import { api, DraftRun, EmailDraft, MailboxStatus, RankedContact } from "@/lib/api";
+import {
+  api,
+  DraftRun,
+  EmailDraft,
+  MailboxStatus,
+  ObjectivePlan,
+  RankedContact,
+} from "@/lib/api";
 
 /**
  * Objective-first outreach.
@@ -24,6 +31,11 @@ const QUICK_STARTS: Array<{ label: string; objective: string }> = [
   { label: "Board seat", objective: "Find people who could help secure a board seat" },
 ];
 
+/** Only a draft that actually generated can be reviewed and sent. */
+function isSendable(draft: EmailDraft) {
+  return draft.status !== "sent" && draft.status !== "failed";
+}
+
 export default function CompassPage() {
   const [mailboxes, setMailboxes] = useState<MailboxStatus[]>([]);
   const [included, setIncluded] = useState<Set<string>>(new Set());
@@ -33,6 +45,13 @@ export default function CompassPage() {
 
   const [ranked, setRanked] = useState<RankedContact[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [openEvidence, setOpenEvidence] = useState<Set<string>>(new Set());
+  // The answers that turn a one-line objective into a filter. Proposed by the model, edited
+  // by the user, and scored against — so "investors" can mean what Dalbir means by it.
+  const [plan, setPlan] = useState<ObjectivePlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  // mailbox id -> the signature appended to its drafts, so the line count excludes it.
+  const [signatures, setSignatures] = useState<Record<string, string>>({});
   const [summary, setSummary] = useState<string | null>(null);
 
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
@@ -61,6 +80,16 @@ export default function CompassPage() {
         prev.size > 0 ? prev : new Set(data.items.filter((m) => m.can_read).map((m) => m.id))
       );
       setError(data.config_error);
+      try {
+        const senders = await api.senders();
+        setSignatures(
+          Object.fromEntries(
+            senders.items.map((p) => [p.mailbox_id, p.effective_signature || ""])
+          )
+        );
+      } catch {
+        // A missing profile only affects the line count hint, never the draft itself.
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load mailboxes");
     } finally {
@@ -83,7 +112,7 @@ export default function CompassPage() {
         if (cancelled || !run) return;
         if (run.items?.length) {
           setDrafts(run.items);
-          setSelectedDrafts(new Set(run.items.filter((d) => d.status !== "sent").map((d) => d.id)));
+          setSelectedDrafts(new Set(run.items.filter(isSendable).map((d) => d.id)));
         }
         setDraftRun(run);
         if (run.status === "running") followDraftRun(run.id);
@@ -108,6 +137,15 @@ export default function CompassPage() {
     });
   }
 
+  function toggleEvidence(id: string) {
+    setOpenEvidence((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   function toggleContact(id: string) {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -117,7 +155,36 @@ export default function CompassPage() {
     });
   }
 
-  async function handleContinue() {
+  async function handlePlan() {
+    if (!objective.trim()) {
+      setError("Describe what you want to accomplish first");
+      return;
+    }
+    setPlanning(true);
+    setError(null);
+    try {
+      const result = await api.objectivePlan(objective.trim());
+      setPlan(result);
+      if (result.questions.length === 0) {
+        // No questions worth asking — go straight to the search rather than stalling.
+        await handleContinue(result);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not plan this objective");
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  function editAnswer(index: number, answer: string) {
+    setPlan((prev) =>
+      prev
+        ? { ...prev, questions: prev.questions.map((q, i) => (i === index ? { ...q, answer } : q)) }
+        : prev
+    );
+  }
+
+  async function handleContinue(usePlan: ObjectivePlan | null = plan) {
     if (!objective.trim()) {
       setError("Describe what you want to accomplish first");
       return;
@@ -136,7 +203,8 @@ export default function CompassPage() {
         [],
         scanDepth,
         shortlistSize,
-        Array.from(included)
+        Array.from(included),
+        usePlan
       );
       setRanked(result.items);
       setSelected(new Set(result.items.map((r) => r.contact_id)));
@@ -200,7 +268,12 @@ export default function CompassPage() {
         objective.trim(),
         // Pass the searched mailboxes so each draft is pinned to the one that already
         // corresponds with its recipient.
-        Array.from(included)
+        Array.from(included),
+        chosen.map((r) => ({
+          contact_id: r.contact_id,
+          reason: r.reason,
+          score: r.objective_score,
+        }))
       );
       if (run.already_running) {
         setNotice("A drafting run was already going — showing its progress.");
@@ -246,7 +319,7 @@ export default function CompassPage() {
         setDraftRun(run);
         if (run.items) {
           setDrafts(run.items);
-          setSelectedDrafts(new Set(run.items.map((d) => d.id)));
+          setSelectedDrafts(new Set(run.items.filter(isSendable).map((d) => d.id)));
         }
 
         if (run.status !== "running") {
@@ -344,7 +417,7 @@ export default function CompassPage() {
   }
 
   async function handleSendAll() {
-    const ids = drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").map((d) => d.id);
+    const ids = drafts.filter((d) => selectedDrafts.has(d.id) && isSendable(d)).map((d) => d.id);
     if (ids.length === 0) {
       setError("No unsent drafts are selected");
       return;
@@ -493,11 +566,57 @@ export default function CompassPage() {
 
           <button
             className="button primary continue-btn"
-            onClick={handleContinue}
-            disabled={searching || !objective.trim() || included.size === 0}
+            onClick={handlePlan}
+            disabled={planning || searching || !objective.trim() || included.size === 0}
           >
-            {searching ? "Finding your people…" : "Continue"}
+            {planning
+              ? "Thinking it through…"
+              : searching
+                ? "Finding your people…"
+                : "Plan with AI"}
           </button>
+
+          {plan && plan.questions.length > 0 && (
+            /* The objective alone is too coarse to rank on: "investors" means something
+               specific to the person typing it. Every answer here is already filled in, so
+               the fast path is to read them and press the button. */
+            <div className="plan-box">
+              <div className="plan-head">
+                <strong>Before I search — is this what you mean?</strong>
+                <span className="meta">Answers are filled in for you. Edit any of them.</span>
+              </div>
+
+              {plan.looking_for && (
+                <p className="meta plan-summary">Looking for: {plan.looking_for}</p>
+              )}
+              {plan.avoid && <p className="meta plan-summary">Leaving out: {plan.avoid}</p>}
+
+              {plan.questions.map((q, i) => (
+                <label key={i} className="plan-question">
+                  <span className="plan-q">{q.question}</span>
+                  <textarea
+                    rows={2}
+                    value={q.answer}
+                    onChange={(e) => editAnswer(i, e.target.value)}
+                  />
+                  {q.why && <span className="meta">{q.why}</span>}
+                </label>
+              ))}
+
+              <div className="actions">
+                <button
+                  className="primary"
+                  onClick={() => handleContinue()}
+                  disabled={searching || included.size === 0}
+                >
+                  {searching ? "Finding your people…" : `Find my ${shortlistSize} people`}
+                </button>
+                <button className="link-btn" onClick={() => setPlan(null)} disabled={searching}>
+                  Skip these
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -631,26 +750,44 @@ export default function CompassPage() {
 
           <div className="ranked-list">
             {ranked.map((r, i) => (
-              <label
+              <div
                 key={r.contact_id}
                 className={`ranked-item${selected.has(r.contact_id) ? " selected" : ""}`}
               >
-                <input
-                  type="checkbox"
-                  checked={selected.has(r.contact_id)}
-                  onChange={() => toggleContact(r.contact_id)}
-                />
-                <span className="rank">{i + 1}</span>
-                <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
-                  {r.objective_score === null ? "—" : r.objective_score}
-                </span>
-                <span className="who">
-                  <strong>{r.full_name || r.primary_email}</strong>
-                  {r.company_name ? ` · ${r.company_name}` : ""}
-                  {r.review_status === "approved" && <em className="approved-tag"> approved</em>}
-                  <span className="why">{r.reason || "No score returned for this contact."}</span>
-                </span>
-              </label>
+                <label className="ranked-main">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(r.contact_id)}
+                    onChange={() => toggleContact(r.contact_id)}
+                  />
+                  <span className="rank">{i + 1}</span>
+                  <span className={`score${r.objective_score === null ? " unscored" : ""}`}>
+                    {r.objective_score === null ? "—" : r.objective_score}
+                  </span>
+                  <span className="who">
+                    <strong>{r.full_name || r.primary_email}</strong>
+                    {r.company_name ? ` · ${r.company_name}` : ""}
+                    {r.review_status === "approved" && <em className="approved-tag"> approved</em>}
+                    <span className="why">{r.reason || "No score returned for this contact."}</span>
+                  </span>
+                </label>
+                {r.evidence && (
+                  <div className="ranked-evidence">
+                    <button
+                      type="button"
+                      className="link-btn"
+                      onClick={() => toggleEvidence(r.contact_id)}
+                    >
+                      {openEvidence.has(r.contact_id) ? "Hide evidence" : "Show evidence"}
+                    </button>
+                    {openEvidence.has(r.contact_id) && (
+                      /* Exactly what the ranker was shown. A wrong pick is only obvious next
+                         to the evidence it was picked on. */
+                      <pre className="evidence-block">{r.evidence}</pre>
+                    )}
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -660,7 +797,7 @@ export default function CompassPage() {
         <div className="outreach-panel" style={{ marginTop: 16 }}>
           <div className="panel-header">
             <h2>
-              Review drafts ({drafts.filter((d) => d.status !== "sent").length} to send
+              Review drafts ({drafts.filter(isSendable).length} to send
               {drafts.some((d) => d.status === "sent") &&
                 `, ${drafts.filter((d) => d.status === "sent").length} sent`}
               )
@@ -668,7 +805,7 @@ export default function CompassPage() {
             <div className="actions">
               <button
                 className="link-btn"
-                onClick={() => setSelectedDrafts(new Set(drafts.map((d) => d.id)))}
+                onClick={() => setSelectedDrafts(new Set(drafts.filter(isSendable).map((d) => d.id)))}
               >
                 Select all
               </button>
@@ -688,7 +825,7 @@ export default function CompassPage() {
               {sending
                 ? "Sending…"
                 : `Send draft to all (${
-                    drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").length
+                    drafts.filter((d) => selectedDrafts.has(d.id) && isSendable(d)).length
                   })`}
             </button>
           </div>
@@ -701,6 +838,7 @@ export default function CompassPage() {
                 index={i}
                 total={drafts.length}
                 mailboxes={mailboxes}
+                signature={signatures[draft.sending_mailbox_id || ""] || ""}
                 selected={selectedDrafts.has(draft.id)}
                 busy={busyDraft === draft.id || sending}
                 onToggle={() =>
