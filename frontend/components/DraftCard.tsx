@@ -67,8 +67,15 @@ function PersonalizationPanel({ data }: { data: Personalization }) {
           What we know they&apos;re doing
           {total > 0 && <span className="draft-brief-count">{total}</span>}
         </span>
-        <span className="meta">{open ? "hide" : "show evidence"}</span>
+        <span className="meta">{open ? "hide evidence" : "show evidence"}</span>
       </button>
+
+      <p className="draft-brief-explainer">
+        Facts about this person taken from your own email history with them, and used to write
+        the email below. <strong>Show evidence</strong> reveals the exact sentence each one came
+        from, so you can check any claim before you send.
+        {readNote ? ` We ${readNote} for this.` : ""}
+      </p>
 
       {activity.length > 0 && <BriefItems items={activity} open={open} />}
 
@@ -131,12 +138,16 @@ export function DraftCard({
   const fromMailbox = mailboxes.find((m) => m.id === from) || null;
   const bodyLines = (draft.body || "").split("\n").filter((l) => l.trim()).length;
   const isSent = draft.status === "sent";
+  // A draft that did not generate correctly is kept visible so it can be regenerated, but it
+  // must never look ready: no ticking it, no sending it.
+  const hasFailed = draft.status === "failed";
+  const locked = isSent || hasFailed;
 
   return (
-    <div className={`draft-card${selected ? " selected" : ""}${isSent ? " sent" : ""}`}>
+    <div className={`draft-card${selected ? " selected" : ""}${isSent ? " sent" : ""}${hasFailed ? " failed" : ""}`}>
       <div className="draft-card-head">
         <label className="draft-card-who">
-          <input type="checkbox" checked={selected} onChange={onToggle} disabled={isSent} />
+          <input type="checkbox" checked={selected && !hasFailed} onChange={onToggle} disabled={locked} />
           <span>
             <strong>{draft.contact_name || draft.contact_email}</strong>
             <span className={`draft-status ${draft.status}`}> {draft.status}</span>
@@ -156,7 +167,7 @@ export function DraftCard({
           <select
             value={from}
             onChange={(e) => onChangeMailbox(e.target.value)}
-            disabled={isSent}
+            disabled={locked}
           >
             {!from && <option value="">Choose a mailbox…</option>}
             {sendable.map((m) => (
@@ -215,7 +226,7 @@ export function DraftCard({
           <button className="link-btn danger" onClick={onDelete} disabled={busy || isSent}>
             Delete
           </button>
-          <button className="primary" onClick={onSend} disabled={busy || isSent || !from}>
+          <button className="primary" onClick={onSend} disabled={busy || locked || !from}>
             {isSent ? "Sent" : "Send this one"}
           </button>
         </div>

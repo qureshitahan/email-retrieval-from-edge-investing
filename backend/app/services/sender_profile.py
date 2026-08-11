@@ -192,6 +192,45 @@ async def analyse_document(name: str, filename: str, content: str) -> dict:
     }
 
 
+# This tool has exactly one user, so his identity is known and there is no reason to make him
+# type it into three separate forms before the first draft is any good. Seeded on creation
+# only: everything here stays editable, and an edit is never overwritten.
+DALBIR = {
+    "display_name": "Dalbir Bains",
+    "title": "CEO",
+    "phone": "+1 646 957 7762",
+    "linkedin_url": "https://www.linkedin.com/in/dalbir-bains/",
+}
+
+# Company and website follow the mailbox — outreach from Galaxy must not sign as Edge.
+_BY_DOMAIN = {
+    # No website given for Edge Investing, so none is set rather than guessed — an invented URL
+    # in a signature is worse than no URL.
+    "edgeinvesting.ca": {"company": "Edge Investing"},
+    "galaxypharma.net": {"company": "Galaxy Pharma", "website": "galaxypharma.net"},
+    "tekhqs.ai": {"company": "Tekhqs", "website": "tekhqs.com"},
+    "tekhqs.com": {"company": "Tekhqs", "website": "tekhqs.com"},
+}
+
+
+def seed_values_for(mailbox_id: str) -> dict:
+    """Defaults for a brand-new profile, keyed off the mailbox's own address."""
+    try:
+        from app.services.mailboxes import get_mailbox
+
+        mailbox = get_mailbox(mailbox_id)
+    except Exception:  # noqa: BLE001 - a missing mailbox just means no seed
+        return {}
+    if mailbox is None or not mailbox.from_email:
+        return {}
+
+    domain = mailbox.from_email.strip().lower().rsplit("@", 1)[-1]
+    company = _BY_DOMAIN.get(domain)
+    if company is None:
+        return dict(DALBIR)
+    return {**DALBIR, **company}
+
+
 def get_or_create_profile(db: Session, mailbox_id: str) -> SenderProfile:
     profile = (
         db.query(SenderProfile)
@@ -200,7 +239,7 @@ def get_or_create_profile(db: Session, mailbox_id: str) -> SenderProfile:
         .one_or_none()
     )
     if profile is None:
-        profile = SenderProfile(mailbox_id=mailbox_id)
+        profile = SenderProfile(mailbox_id=mailbox_id, **seed_values_for(mailbox_id))
         db.add(profile)
         db.commit()
         db.refresh(profile)

@@ -84,6 +84,19 @@ because it is obviously not a mass send. Name the concrete thing: the company, t
 introduction, the role. No more than about eight words. Never a generic label like "Quick
 question", "Following up" or "Introduction".
 
+FORMAT, exactly:
+- First line is a greeting: "Hi <first name>," — nothing before it.
+- Blank line, then the body in short paragraphs separated by blank lines.
+- Blank line, then "Best regards" on its own line.
+
+You always produce an email. Never refuse, never explain yourself, never comment on the brief
+or on how well the objective fits this person, and never use markdown. If the objective is a
+poor fit for this relationship — they are a supplier rather than an investor, a recruiter
+rather than a partner — do not force the pitch and do not raise the mismatch. Write a short,
+genuine note that fits the relationship you actually have and make the ask lightly, or simply
+continue the conversation. A brief honest email is always the right answer; a paragraph
+explaining your concerns is never an email and cannot be sent.
+
 Rules:
 - Only reference specifics that appear in the context. Precision beats warmth.
 - Do not stack achievements — theirs or the sender's. One of each, well chosen, beats three.
@@ -281,6 +294,83 @@ def _parse_draft_response(text: str) -> tuple[str, str]:
     return "", "\n".join(candidates).strip()
 
 
+# Openings and phrases that mean the model talked *about* the email instead of writing one.
+# This happened in production: asked to pitch fundraising to an IT supplier, it returned
+# "I need to pause before drafting this email. **The context creates a serious mismatch...**",
+# which was stored with an empty subject and shown as ready to send.
+_REFUSAL_OPENERS = (
+    "i need to pause",
+    "i should flag",
+    "i can't",
+    "i cannot",
+    "i won't",
+    "i will not",
+    "before drafting",
+    "before i draft",
+    "a note on",
+    "note:",
+    "important:",
+    "caveat",
+    "i'd recommend not",
+    "i would recommend not",
+    "i have a concern",
+    "here's my concern",
+    "this doesn't look right",
+)
+_REFUSAL_PHRASES = (
+    "mismatch with the ask",
+    "creates a serious mismatch",
+    "i'm not going to",
+    "i am not going to",
+    "would not be appropriate",
+    "is not appropriate to send",
+    "recommend against sending",
+    "cannot write this email",
+    "should not be sent",
+)
+MAX_DRAFT_BODY_WORDS = 400
+
+
+def validate_draft(subject: str, body: str) -> str | None:
+    """None when this is a sendable email, else a short reason why it is not.
+
+    The parser is deliberately forgiving about formatting, which means it will happily turn a
+    refusal into a body with no subject. This is the check that stops that reaching the review
+    screen looking like a finished draft.
+    """
+    subject = (subject or "").strip()
+    body = (body or "").strip()
+
+    if not subject:
+        return "the model returned no subject line"
+    if not body:
+        return "the model returned no message body"
+    if len(subject) > 160:
+        return "the subject line is a paragraph, not a subject"
+
+    lowered = body.lower()
+    head = lowered[:500]
+    if any(head.lstrip().startswith(marker) for marker in _REFUSAL_OPENERS):
+        return "the model commented on the request instead of writing the email"
+    if any(phrase in head for phrase in _REFUSAL_PHRASES):
+        return "the model raised a concern instead of writing the email"
+    # Markdown headers and bold are how it formats commentary; a real email has neither.
+    if "**" in body or body.lstrip().startswith("#"):
+        return "the model returned notes rather than an email"
+    if len(body.split()) > MAX_DRAFT_BODY_WORDS:
+        return "the response is far too long to be the email that was asked for"
+    return None
+
+
+RETRY_INSTRUCTION = (
+    "\n\nYour previous response was not an email and could not be used. Output ONLY a subject "
+    "line and an email body, in exactly the format asked for above, starting with "
+    "'Subject: '. Do not explain, do not comment on the brief, do not use markdown, and do not "
+    "raise concerns about whether the objective suits this person. If the objective does not "
+    "fit them, write a short genuine note that suits the relationship instead."
+)
+
+
 def get_or_create_prompt(db: Session) -> OutreachPrompt:
     row = db.query(OutreachPrompt).filter(OutreachPrompt.id == "default").one_or_none()
     if row:
@@ -348,6 +438,77 @@ def sender_profile_for(db: Session, mailbox_id: str | None):
         .filter(SenderProfile.mailbox_id == mailbox_id)
         .one_or_none()
     )
+
+
+_GREETING_RE = re.compile(r"^(hi|hello|hey|dear|good morning|good afternoon)\b", re.IGNORECASE)
+
+# Honorifics, and the role words that mean the address has no person behind it.
+_NOT_A_FIRST_NAME = {
+    "dr", "mr", "mrs", "ms", "miss", "prof", "professor", "sir", "rev", "hon",
+    "info", "team", "sales", "support", "admin", "the", "office", "contact", "hello",
+}
+
+
+def first_name_for(full_name: str | None, email: str | None) -> str:
+    """A name to greet someone by, or "there" when nothing usable is on file.
+
+    Handles the shapes that actually appear in a mailbox: quoted names, "Surname, First"
+    from directory exports, and role addresses with no person behind them at all.
+    """
+    name = (full_name or "").strip().strip("'\"")
+    if "," in name:
+        # "Warga, Brent" is a directory export, not a person called Warga.
+        after = name.split(",", 1)[1].strip()
+        if after:
+            name = after
+    # "Dr. Anjan Chatterji" must greet Anjan, not Dr.
+    parts = [re.sub(r"[^A-Za-z'\-]", "", part) for part in re.split(r"[\s.]+", name)]
+    token = next(
+        (part for part in parts if len(part) >= 2 and part.lower() not in _NOT_A_FIRST_NAME),
+        "",
+    )
+    if token:
+        return token[:1].upper() + token[1:]
+
+    local = (email or "").split("@", 1)[0]
+    token = re.sub(r"[^A-Za-z'\-]", "", re.split(r"[._\-]+", local)[0] if local else "")
+    if len(token) >= 2 and token.lower() not in _NOT_A_FIRST_NAME:
+        return token[:1].upper() + token[1:]
+    return "there"
+
+
+def ensure_greeting(body: str, first_name: str) -> str:
+    """Guarantee the email opens on a greeting line of its own.
+
+    Left to the prompt alone this came out three different ways — "Hi Tyler,", a bare "Tyler,",
+    and the name folded into the first sentence ("Jasman, you asked me to…"). A greeting is a
+    fixed piece of structure, not a judgement call, so it is applied here rather than asked for.
+    """
+    text = (body or "").lstrip()
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    first = lines[0].strip()
+
+    if _GREETING_RE.match(first):
+        return text
+
+    # "Tyler," alone on the first line — the right shape, just missing the greeting word.
+    if re.fullmatch(rf"{re.escape(first_name)}\s*[,:—-]?", first, re.IGNORECASE):
+        lines[0] = f"Hi {first_name},"
+        return "\n".join(lines)
+
+    # "Jasman, you asked me to…" — the name is doing double duty as greeting and sentence.
+    # Lift it out and promote the remainder to the opening sentence.
+    inline = re.match(rf"{re.escape(first_name)}\s*[,—-]\s+(.+)", first, re.IGNORECASE)
+    if inline:
+        rest = inline.group(1).strip()
+        rest = rest[:1].upper() + rest[1:] if rest else ""
+        lines[0] = rest
+        return f"Hi {first_name},\n\n" + "\n".join(lines).lstrip()
+
+    return f"Hi {first_name},\n\n{text}"
 
 
 def append_signature(body: str, signature: str) -> str:
@@ -503,7 +664,7 @@ async def generate_draft_for_contact(
     # mean a Galaxy pitch going out over an Edge Investing signature.
     existing_draft = (
         db.query(EmailDraft)
-        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved"]))
+        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved", "failed"]))
         .order_by(EmailDraft.created_at.desc())
         .first()
     )
@@ -540,23 +701,42 @@ async def generate_draft_for_contact(
     # and the health check Azure uses to decide whether the container is alive.
     raw = await _call_anthropic_async(prompt_row.system_prompt, user_prompt)
     subject, body = _parse_draft_response(raw)
+
+    # One corrective retry before giving up. A response that talks about the email instead of
+    # being one is nearly always fixed by saying so plainly, and it is far better to spend a
+    # second call than to put commentary in front of a real client as a finished draft.
+    problem = validate_draft(subject, body)
+    if problem:
+        retry = await _call_anthropic_async(
+            prompt_row.system_prompt, user_prompt + RETRY_INSTRUCTION
+        )
+        retry_subject, retry_body = _parse_draft_response(retry)
+        if validate_draft(retry_subject, retry_body) is None:
+            subject, body, problem = retry_subject, retry_body, None
+
+    body = ensure_greeting(body, first_name_for(contact.full_name, contact.primary_email))
     body = append_signature(body, signature_for(sender, sender_name))
 
     existing = (
         db.query(EmailDraft)
-        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved"]))
+        .filter(EmailDraft.contact_id == contact_id, EmailDraft.status.in_(["draft", "approved", "failed"]))
         .order_by(EmailDraft.created_at.desc())
         .first()
     )
     draft = existing or EmailDraft(contact_id=contact_id)
     draft.subject = subject
     draft.body = body
-    draft.status = "draft"
+    # A draft that failed validation is kept so the reviewer can see what came back and why,
+    # but it is marked failed rather than "draft": it must not sit in the review list looking
+    # ready, and "send all" must skip it.
+    draft.status = "failed" if problem else "draft"
+    draft.error_message = (
+        f"Not sent — {problem}. Press Regenerate to try again." if problem else None
+    )
     draft.custom_instructions = instructions
     draft.system_prompt = prompt_row.system_prompt
     draft.user_prompt = user_prompt
     draft.personalization = summarize_personalization(brief)
-    draft.error_message = None
     draft.updated_at = datetime.utcnow()
 
     # Route the reply back through the mailbox that already holds this relationship, so a
@@ -988,6 +1168,10 @@ async def send_draft(db: Session, draft_id: str, *, mailbox_id: str | None = Non
         raise OutreachError("Draft not found")
     if draft.status == "sent":
         raise OutreachError("Draft already sent")
+    if draft.status == "failed":
+        raise OutreachError(
+            draft.error_message or "This draft did not generate correctly — regenerate it first"
+        )
     contact = draft.contact
     if not contact:
         raise OutreachError("Contact not found")

@@ -313,10 +313,24 @@ export default function SendersPage() {
                 <h2>Proof points</h2>
                 <span className="meta">{profile.proof_points.length} in use</span>
               </div>
-              <p className="meta">
-                A draft uses at most one of these, chosen to fit the person being written to.
-                Edit any of them &mdash; hand-edited points are kept when documents are re-read.
-              </p>
+              <div className="explainer">
+                <p>
+                  <strong>A proof point is one specific thing you have actually done</strong>,
+                  written so it can be dropped straight into an email &mdash; &ldquo;Raised and
+                  deployed over $120M in capital and executed 50 acquisitions&rdquo;, not
+                  &ldquo;strong leadership skills&rdquo;.
+                </p>
+                <p>
+                  They are pulled out of the documents you upload below, and each one keeps the
+                  sentence it came from, so nothing can be exaggerated &mdash; if your
+                  r&eacute;sum&eacute; says $120M, no email can say $150M.
+                </p>
+                <p>
+                  Every draft opens on the recipient, then uses <strong>at most one</strong> of
+                  these to earn the ask, picking whichever fits that person. Edit or delete any
+                  of them; anything you type by hand is kept when documents are re-read.
+                </p>
+              </div>
 
               <ul className="proof-list">
                 {profile.proof_points.map((point, i) => (

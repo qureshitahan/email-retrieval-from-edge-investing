@@ -1164,6 +1164,43 @@ label.stacked {
   }
 }
 
+/* A short plain-English note explaining a panel to someone seeing it for the first time. */
+.explainer {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f6f9ff;
+  border: 1px solid #d6e4ff;
+  font-size: 0.82rem;
+  color: #344054;
+}
+
+.explainer p {
+  margin: 0 0 6px;
+}
+
+.explainer p:last-child {
+  margin-bottom: 0;
+}
+
+.draft-brief-explainer {
+  margin: 6px 0 2px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: #4c586e;
+}
+
+/* A draft that did not generate. Marked clearly so it is never mistaken for one ready to go. */
+.draft-card.failed {
+  border-color: #f3c6c0;
+  background: #fffaf9;
+}
+
+.draft-status.failed {
+  color: #b42318;
+  font-weight: 700;
+}
+
 /* --- bulk drafting progress --- */
 .draft-progress {
   display: grid;

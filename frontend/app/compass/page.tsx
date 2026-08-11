@@ -24,6 +24,11 @@ const QUICK_STARTS: Array<{ label: string; objective: string }> = [
   { label: "Board seat", objective: "Find people who could help secure a board seat" },
 ];
 
+/** Only a draft that actually generated can be reviewed and sent. */
+function isSendable(draft: EmailDraft) {
+  return draft.status !== "sent" && draft.status !== "failed";
+}
+
 export default function CompassPage() {
   const [mailboxes, setMailboxes] = useState<MailboxStatus[]>([]);
   const [included, setIncluded] = useState<Set<string>>(new Set());
@@ -84,7 +89,7 @@ export default function CompassPage() {
         if (cancelled || !run) return;
         if (run.items?.length) {
           setDrafts(run.items);
-          setSelectedDrafts(new Set(run.items.filter((d) => d.status !== "sent").map((d) => d.id)));
+          setSelectedDrafts(new Set(run.items.filter(isSendable).map((d) => d.id)));
         }
         setDraftRun(run);
         if (run.status === "running") followDraftRun(run.id);
@@ -256,7 +261,7 @@ export default function CompassPage() {
         setDraftRun(run);
         if (run.items) {
           setDrafts(run.items);
-          setSelectedDrafts(new Set(run.items.map((d) => d.id)));
+          setSelectedDrafts(new Set(run.items.filter(isSendable).map((d) => d.id)));
         }
 
         if (run.status !== "running") {
@@ -354,7 +359,7 @@ export default function CompassPage() {
   }
 
   async function handleSendAll() {
-    const ids = drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").map((d) => d.id);
+    const ids = drafts.filter((d) => selectedDrafts.has(d.id) && isSendable(d)).map((d) => d.id);
     if (ids.length === 0) {
       setError("No unsent drafts are selected");
       return;
@@ -688,7 +693,7 @@ export default function CompassPage() {
         <div className="outreach-panel" style={{ marginTop: 16 }}>
           <div className="panel-header">
             <h2>
-              Review drafts ({drafts.filter((d) => d.status !== "sent").length} to send
+              Review drafts ({drafts.filter(isSendable).length} to send
               {drafts.some((d) => d.status === "sent") &&
                 `, ${drafts.filter((d) => d.status === "sent").length} sent`}
               )
@@ -696,7 +701,7 @@ export default function CompassPage() {
             <div className="actions">
               <button
                 className="link-btn"
-                onClick={() => setSelectedDrafts(new Set(drafts.map((d) => d.id)))}
+                onClick={() => setSelectedDrafts(new Set(drafts.filter(isSendable).map((d) => d.id)))}
               >
                 Select all
               </button>
@@ -716,7 +721,7 @@ export default function CompassPage() {
               {sending
                 ? "Sending…"
                 : `Send draft to all (${
-                    drafts.filter((d) => selectedDrafts.has(d.id) && d.status !== "sent").length
+                    drafts.filter((d) => selectedDrafts.has(d.id) && isSendable(d)).length
                   })`}
             </button>
           </div>
